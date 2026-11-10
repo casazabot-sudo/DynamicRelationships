@@ -1,0 +1,45 @@
+#dynamic-relationships-extension {
+    margin: 0.5rem 0;
+    color: var(--SmartThemeBodyColor);
+}
+#dynamic-relationships-extension .dr-details {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 0.65rem;
+    background: var(--SmartThemeBlurTintColor);
+}
+#dynamic-relationships-extension summary { cursor: pointer; font-weight: 700; }
+#dynamic-relationships-extension .dr-count {
+    display: block; color: var(--SmartThemeEmColor);
+    font-size: 0.8em; font-weight: 400; margin-top: 0.25rem;
+}
+#dynamic-relationships-extension .dr-content { display: grid; gap: 0.65rem; margin-top: 0.75rem; }
+#dynamic-relationships-extension .dr-toolbar { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+#dynamic-relationships-extension button {
+    cursor: pointer; border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px; padding: 0.35rem 0.6rem;
+    color: var(--SmartThemeBodyColor); background: var(--SmartThemeBlurTintColor);
+}
+#dynamic-relationships-extension button:disabled { opacity: 0.45; cursor: default; }
+#dynamic-relationships-extension .dr-relation,
+#dynamic-relationships-extension .dr-entities,
+#dynamic-relationships-extension .dr-journal {
+    border: 1px solid var(--SmartThemeBorderColor); border-radius: 7px; padding: 0.6rem;
+}
+#dynamic-relationships-extension .dr-status {
+    float: right; opacity: 0.7; font-size: 0.8em; font-weight: 400;
+}
+#dynamic-relationships-extension .dr-metric {
+    display: grid; grid-template-columns: minmax(130px, 1fr) minmax(70px, 32%);
+    align-items: center; gap: 0.5rem; margin-top: 0.35rem; font-size: 0.82em;
+}
+#dynamic-relationships-extension .dr-bar {
+    height: 6px; border-radius: 999px; overflow: hidden;
+    background: var(--SmartThemeQuoteColor);
+}
+#dynamic-relationships-extension .dr-bar i {
+    display: block; height: 100%; background: var(--SmartThemeEmColor); border-radius: inherit;
+}
+#dynamic-relationships-extension .dr-muted { opacity: 0.7; font-size: 0.88em; margin: 0; }
+#dynamic-relationships-extension .dr-entities p,
+#dynamic-relationships-extension .dr-journal p { margin: 0.4rem 0; font-size: 0.85em; }
