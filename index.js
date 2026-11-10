@@ -1,4 +1,4 @@
-/* Dynamic Relationships 0.2.0
+/* Dynamic Relationships 0.3.0
  * Chat-scoped relationship database + generated lorebook projection.
  * SillyTavern UI extension; no external dependencies.
  */
@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.2.1';
+    const VERSION = '0.3.0';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -33,6 +33,7 @@
     let busy = false;
     let registered = false;
     let refreshQueued = false;
+    let lorebookListCache = null;
 
     const log = (...args) => console[settings()?.debug ? 'debug' : 'log'](`[${MODULE}]`, ...args);
     const getContext = () => window.SillyTavern?.getContext?.();
@@ -55,6 +56,9 @@
             processedExchanges: [],
             journal: [],
             lorebookProjection: { title: 'Dynamic Relationships — managed projection', content: '', updatedAt: null },
+            excludeMainCharacter: false,
+            targetLorebook: '',
+            lorebookEntryUid: null,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
@@ -67,6 +71,9 @@
         state.journal ??= [];
         state.processedExchanges ??= state.processedMessages ?? [];
         state.lorebookProjection ??= { title: 'Dynamic Relationships — managed projection', content: '', updatedAt: null };
+        state.excludeMainCharacter ??= false;
+        state.targetLorebook ??= '';
+        state.lorebookEntryUid ??= null;
         for (const rel of Object.values(state.relationships)) {
             rel.scores ??= {};
             for (const metric of METRICS) rel.scores[metric] = clampScore(rel.scores[metric] ?? 50);
@@ -204,10 +211,11 @@
     }
 
     function buildPrompt(transcript, state) {
-        const known = Object.values(state.entities).map(e =>
+        const ignoredMain = state.excludeMainCharacter ? norm(getActiveNames().mainName) : '';
+        const known = Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).map(e =>
             `${e.name} [${e.type}]${e.aliases?.length ? `; aliases: ${e.aliases.join(', ')}` : ''}`
         ).join('\n') || '(пока нет)';
-        const edges = Object.values(state.relationships).map(r => ({
+        const edges = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).map(r => ({
             from: state.entities[r.sourceId]?.name,
             to: state.entities[r.targetId]?.name,
             scores: r.scores,
@@ -221,6 +229,7 @@
 Новые сущности должны иметь имя, тип npc/user/main_character и aliases. Имена новых сущностей должны встречаться в тексте фрагмента (имя или однозначный псевдоним).
 Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence — короткое подтверждение из фрагмента.
 Не создавай отношения персонажа с самим собой. Не делай массовые изменения всем участникам без отдельного основания.
+${state.excludeMainCharacter ? `ВАЖНО: ${getActiveNames().mainName} — нейтральный рассказчик, не участник истории. Не добавляй его как сущность и не создавай отношения от его имени или к нему.` : ''}
 
 Известные участники:
 ${known}
@@ -276,13 +285,14 @@ ${body}
 
         const active = getActiveNames();
         const user = ensureEntity(state, active.userName, 'user');
-        const main = ensureEntity(state, active.mainName, 'main_character');
+        const ignoredMainName = state.excludeMainCharacter ? norm(active.mainName) : '';
+        const main = state.excludeMainCharacter ? null : ensureEntity(state, active.mainName, 'main_character');
         nameMap.set(norm(user.name), user);
-        nameMap.set(norm(main.name), main);
+        if (main) nameMap.set(norm(main.name), main);
 
         for (const candidate of (Array.isArray(result.entities) ? result.entities : []).slice(0, 30)) {
             const name = cleanName(candidate?.name);
-            if (!name || !appearsInTranscript(name, transcript)) continue;
+            if (!name || (ignoredMainName && norm(name) === ignoredMainName) || !appearsInTranscript(name, transcript)) continue;
             const existing = findEntity(state, name);
             const type = existing?.type || (['user', 'main_character', 'npc'].includes(candidate.type) ? candidate.type : 'npc');
             const entity = ensureEntity(state, existing?.name || name, type, candidate.aliases || []);
@@ -291,6 +301,7 @@ ${body}
 
         // Add speaker entities, including group-chat speakers.
         for (const m of transcript) {
+            if (ignoredMainName && norm(m.name) === ignoredMainName) continue;
             if (!nameMap.has(norm(m.name))) {
                 const entity = ensureEntity(state, m.name, 'npc');
                 nameMap.set(norm(m.name), entity);
@@ -300,6 +311,7 @@ ${body}
         // Resolve aliases in the model's proposed relationships.
         const applied = [];
         for (const item of (Array.isArray(result.interactions) ? result.interactions : []).slice(0, 80)) {
+            if (ignoredMainName && (norm(item?.source) === ignoredMainName || norm(item?.target) === ignoredMainName)) continue;
             const source = findEntity(state, item?.source);
             const target = findEntity(state, item?.target);
             if (!source || !target || source.id === target.id) continue;
@@ -345,8 +357,9 @@ ${body}
     }
 
     function renderLorebookText(state) {
-        const entities = Object.values(state.entities);
-        const relations = Object.values(state.relationships);
+        const ignoredMain = state.excludeMainCharacter ? norm(getActiveNames().mainName) : '';
+        const entities = Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain);
+        const relations = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain));
         const lines = [
             '[DYNAMIC RELATIONSHIPS — актуальное состояние]',
             'Используй эти сведения как текущее состояние истории. Отношения направленные и могут быть не взаимными.',
@@ -375,6 +388,92 @@ ${body}
         state.lorebookProjection.updatedAt = new Date().toISOString();
     }
 
+    async function worldInfoRequest(endpoint, body = {}) {
+        const response = await fetch(`/api/worldinfo/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok) throw new Error(`World Info API ${endpoint}: HTTP ${response.status}`);
+        return response.status === 204 ? null : response.json();
+    }
+
+    async function loadLorebookList(force = false) {
+        if (lorebookListCache && !force) return lorebookListCache;
+        try {
+            const books = await worldInfoRequest('list');
+            lorebookListCache = Array.isArray(books) ? books : [];
+            return lorebookListCache;
+        } catch (err) {
+            console.warn(`[${MODULE}] Cannot load World Info list`, err);
+            toast(`Не удалось загрузить список Lorebook: ${err.message}`, 'warning');
+            return [];
+        }
+    }
+
+    function chatStableId() {
+        const ctx = getContext();
+        const direct = ctx?.chatId || ctx?.chatMetadata?.chat_id || ctx?.chatMetadata?.chatId;
+        if (direct) return String(direct);
+        const firstMessage = String(ctx?.chat?.[0]?.mes || ctx?.chat?.[0]?.text || '');
+        return `chat_${hash(`${ctx?.name1 || ''}|${ctx?.name2 || ''}|${firstMessage}`)}`;
+    }
+
+    function managedEntryKey() {
+        return `dynamic_relationships_${hash(chatStableId())}`;
+    }
+
+    async function syncToSelectedLorebook(showToast = true) {
+        const state = getState();
+        if (!state?.targetLorebook) {
+            if (showToast) toast('Сначала выберите Lorebook для сохранения.', 'warning');
+            return false;
+        }
+        try {
+            rebuildLorebookProjection(state);
+            const book = await worldInfoRequest('get', { name: state.targetLorebook });
+            book.entries ??= {};
+            const marker = managedEntryKey();
+            let uid = null;
+            let existing = null;
+            const found = Object.entries(book.entries).find(([, entry]) => entry?.extensions?.dynamic_relationships?.managedKey === marker);
+            if (found) { uid = Number(found[0]); existing = found[1]; }
+            if (uid == null || !existing) {
+                const numeric = Object.keys(book.entries).map(Number).filter(Number.isFinite);
+                uid = numeric.length ? Math.max(...numeric) + 1 : 0;
+            }
+            const old = existing || {};
+            book.entries[uid] = {
+                ...old,
+                uid,
+                key: ['Dynamic Relationships'],
+                keysecondary: [],
+                comment: `Dynamic Relationships — ${chatStableId()}`,
+                content: state.lorebookProjection.content,
+                constant: true,
+                selective: false,
+                order: Number(old.order ?? 100),
+                position: Number(old.position ?? 1),
+                disable: false,
+                addMemo: true,
+                extensions: {
+                    ...(old.extensions || {}),
+                    dynamic_relationships: { managedKey: marker, chatId: chatStableId(), version: VERSION }
+                }
+            };
+            await worldInfoRequest('edit', { name: state.targetLorebook, data: book });
+            state.lorebookEntryUid = uid;
+            state.lastLorebookSyncAt = new Date().toISOString();
+            await saveState();
+            if (showToast) toast(`Отношения сохранены в Lorebook «${state.targetLorebook}».`);
+            return true;
+        } catch (err) {
+            console.error(`[${MODULE}] Lorebook sync failed`, err);
+            toast(`Не удалось сохранить в Lorebook: ${err.message}`, 'warning');
+            return false;
+        }
+    }
+
     async function analyzeLatestExchange() {
         const cfg = settings();
         if (!cfg.enabled || !cfg.analyzeAutomatically || busy) return;
@@ -399,6 +498,7 @@ ${body}
             state.processedExchanges.push(sig);
             state.processedExchanges = state.processedExchanges.slice(-3000);
             await saveState();
+            if (state.targetLorebook) await syncToSelectedLorebook(false);
             log(`Exchange analyzed; ${applied.length} directed relationship change(s).`);
         } catch (err) {
             console.error(`[${MODULE}] Analysis failed:`, err);
@@ -416,6 +516,28 @@ ${body}
 
     function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    async function populateLorebookSelect(select, selectedName = '') {
+        if (!select) return;
+        const books = await loadLorebookList(false);
+        const current = selectedName || select.value;
+        select.replaceChildren();
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Только внутреннее хранилище чата';
+        select.append(placeholder);
+        for (const book of books) {
+            const option = document.createElement('option');
+            option.value = book.file_id;
+            option.textContent = book.name || book.file_id;
+            select.append(option);
+        }
+        select.value = books.some(b => b.file_id === current) ? current : '';
+        if (current && !select.value) {
+            const state = getState();
+            if (state) { state.targetLorebook = ''; await saveState(); }
+        }
     }
 
     function renderPanel() {
@@ -438,15 +560,63 @@ ${body}
         const analyzeBtn = document.createElement('button');
         analyzeBtn.textContent = 'Анализировать сейчас';
         analyzeBtn.addEventListener('click', () => analyzeLatestExchange());
-        toolbar.append(exportBtn, undoBtn, analyzeBtn);
+        const syncBtn = document.createElement('button');
+        syncBtn.textContent = 'Сохранить в Lorebook';
+        syncBtn.addEventListener('click', () => syncToSelectedLorebook(true));
+        toolbar.append(exportBtn, undoBtn, analyzeBtn, syncBtn);
         content.append(toolbar);
 
+        const configBox = document.createElement('section');
+        configBox.className = 'dr-config';
+        const excludeLabel = document.createElement('label');
+        excludeLabel.className = 'dr-setting';
+        const excludeInput = document.createElement('input');
+        excludeInput.type = 'checkbox';
+        excludeInput.checked = !!state.excludeMainCharacter;
+        excludeInput.addEventListener('change', async () => {
+            state.excludeMainCharacter = excludeInput.checked;
+            await saveState();
+            if (state.targetLorebook) await syncToSelectedLorebook(false);
+        });
+        const excludeText = document.createElement('span');
+        excludeText.textContent = 'Не отслеживать {{char}} (нейтральный рассказчик)';
+        excludeLabel.append(excludeInput, excludeText);
+
+        const loreLabel = document.createElement('label');
+        loreLabel.className = 'dr-setting dr-lorebook-setting';
+        const loreText = document.createElement('span');
+        loreText.textContent = 'Lorebook для сохранения';
+        const loreSelect = document.createElement('select');
+        loreSelect.className = 'dr-lorebook-select';
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Только внутреннее хранилище чата';
+        loreSelect.append(placeholder);
+        loreLabel.append(loreText, loreSelect);
+        const refreshBooks = document.createElement('button');
+        refreshBooks.textContent = 'Обновить список';
+        refreshBooks.addEventListener('click', async () => { await loadLorebookList(true); await populateLorebookSelect(loreSelect, state.targetLorebook); });
+        loreSelect.addEventListener('change', async () => {
+            state.targetLorebook = loreSelect.value;
+            state.lorebookEntryUid = null;
+            await saveState();
+            if (state.targetLorebook) await syncToSelectedLorebook(true);
+        });
+        const loreHint = document.createElement('p');
+        loreHint.className = 'dr-muted';
+        loreHint.textContent = 'Выбранная книга получает отдельную управляемую запись. Она обновляется после анализа; остальные записи книги сохраняются.';
+        configBox.append(excludeLabel, loreLabel, refreshBooks, loreHint);
+        content.append(configBox);
+        populateLorebookSelect(loreSelect, state.targetLorebook);
+
+        const ignoredMain = state.excludeMainCharacter ? norm(getActiveNames().mainName) : '';
+        const visibleEntityCount = Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).length;
+        const visibleRelationCount = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).length;
         const info = document.createElement('p');
         info.className = 'dr-muted';
-        info.textContent = `${Object.keys(state.entities).length} участников · ${Object.keys(state.relationships).length} направленных связей · ${state.journal.length} записей журнала`;
+        info.textContent = `${visibleEntityCount} участников · ${visibleRelationCount} направленных связей · ${state.journal.length} записей журнала`;
         content.append(info);
-
-        const rels = Object.values(state.relationships).sort((a,b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+        const rels = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).sort((a,b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
         if (!rels.length) {
             const empty = document.createElement('p');
             empty.className = 'dr-muted';
@@ -483,7 +653,7 @@ ${body}
         const summary = document.createElement('summary');
         summary.textContent = `Реестр участников (${Object.keys(state.entities).length})`;
         entityBox.append(summary);
-        for (const e of Object.values(state.entities).sort((a,b) => a.name.localeCompare(b.name))) {
+        for (const e of Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).sort((a,b) => a.name.localeCompare(b.name))) {
             const p = document.createElement('p');
             p.textContent = `${e.name} — ${e.type}${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`;
             entityBox.append(p);
@@ -520,6 +690,7 @@ ${body}
             relation.updatedAt = new Date().toISOString();
         }
         await saveState();
+        if (state.targetLorebook) await syncToSelectedLorebook(false);
         toast('Последнее изменение отношений отменено.');
     }
 
