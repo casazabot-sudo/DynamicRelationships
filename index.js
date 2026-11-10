@@ -1,7 +1,7 @@
-/* Dynamic Relationships 0.7.2
+/* Dynamic Relationships 0.8.1
  * Chat-scoped relationship database + generated lorebook projection
- * + scene & character tracking + context history stripping.
- * + collapsible UI sections.
+ * + scene, character & thought tracking + context history stripping.
+ * + 0-200 metric scale migration.
  */
 (() => {
     'use strict';
@@ -11,7 +11,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.7.2';
+    const VERSION = '0.8.1';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -23,12 +23,13 @@
         analyzeAutomatically: true,
         contextMessages: 12,
         minConfidence: 0.68,
-        maxDeltaPerEvent: 8,
+        maxDeltaPerEvent: 16, // Увеличено из-за новой шкалы
         maxEntities: 80,
         maxJournal: 600,
         syncLorebookProjection: true,
         trackSceneModule: true,
         trackCharacterModule: true,
+        trackThoughtsModule: true,
         stripHistoryBlocks: true,
         keepLastBlocks: 2,
         includeNeutralRelations: false,
@@ -38,14 +39,17 @@
     const SCENE_PROMPT_KEY = 'dynamic_relationships_scene';
     const SCENE_BLOCK_MARKER = '--- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---';
     const CHAR_BLOCK_MARKER = '--- ✧ 🌸 ЗАМЕЧАН ПЕРСОНАЖ ✧ ---';
+    const THOUGHT_BLOCK_MARKER = '--- ✧ 💭 ВНУТРЕННИЙ МОНОЛОГ ✧ ---';
 
     // Регулярки для парсинга (для UI)
     const SCENE_BLOCK_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---\s*\n?\s*⌛\s*Дата\s*и\s*Время\s*:\s*([^\n]*)\n?\s*☁️\s*Погода\s*:\s*([^\n]*)\n?\s*✨\s*Локация\s*:\s*([^\n]*)/iu;
     const CHAR_BLOCK_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
+    const THOUGHT_BLOCK_RE = /---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
 
     // Регулярки для полного вырезания из контекста
     const STRIP_SCENE_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
     const STRIP_CHAR_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
+    const STRIP_THOUGHT_RE = /---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
 
     let busy = false;
     let registered = false;
@@ -69,7 +73,7 @@
 
     function freshState() {
         return {
-            schemaVersion: 2,
+            schemaVersion: 3, // Обновлено для 0-200
             entities: {},
             relationships: {},
             processedExchanges: [],
@@ -81,6 +85,7 @@
             scene: { time: '', weather: '', location: '', updatedAt: null },
             sceneByMessageIndex: {},
             charactersByMessageIndex: {},
+            thoughtsByMessageIndex: {},
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
@@ -99,13 +104,25 @@
         state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
         state.sceneByMessageIndex ??= {};
         state.charactersByMessageIndex ??= {};
-        for (const rel of Object.values(state.relationships)) {
-            rel.scores ??= {};
-            for (const metric of METRICS) rel.scores[metric] = clampScore(rel.scores[metric] ?? 50);
-            rel.status ??= 'acquaintances';
-            rel.statusDescription ??= 'Знакомство';
+        state.thoughtsByMessageIndex ??= {};
+
+        // Миграция с 0-100 на 0-200
+        if (!state.schemaVersion || state.schemaVersion < 3) {
+            for (const rel of Object.values(state.relationships)) {
+                rel.scores ??= {};
+                for (const metric of METRICS) {
+                    rel.scores[metric] = clampScore((rel.scores[metric] ?? 50) * 2);
+                }
+            }
+            state.schemaVersion = 3;
+        } else {
+            for (const rel of Object.values(state.relationships)) {
+                rel.scores ??= {};
+                for (const metric of METRICS) rel.scores[metric] = clampScore(rel.scores[metric] ?? 100);
+                rel.status ??= 'acquaintances';
+                rel.statusDescription ??= 'Знакомство';
+            }
         }
-        state.schemaVersion = 2;
         return state;
     }
 
@@ -119,7 +136,7 @@
         return migrateState(ctx.chatMetadata[META_KEY]);
     }
 
-    async function saveState() {
+    async function saveState(render = true) {
         const ctx = getContext();
         const state = getState();
         if (!ctx || !state) return;
@@ -134,7 +151,7 @@
         rebuildLorebookProjection(state);
         if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
         updateSystemInjection();
-        renderPanel();
+        if (render) renderPanel();
     }
 
     async function silentSaveState() {
@@ -183,7 +200,7 @@
 
     function clampScore(value) {
         const n = Number(value);
-        return Math.max(0, Math.min(100, Number.isFinite(n) ? Math.round(n) : 50));
+        return Math.max(0, Math.min(200, Number.isFinite(n) ? Math.round(n) : 100));
     }
 
     function clampDelta(value, max) {
@@ -227,7 +244,7 @@
         state.relationships[key] ??= {
             sourceId: source.id,
             targetId: target.id,
-            scores: Object.fromEntries(METRICS.map(m => [m, 50])),
+            scores: Object.fromEntries(METRICS.map(m => [m, 100])), // Нейтральное значение теперь 100
             status: 'acquaintances',
             statusDescription: 'Знакомство',
             updatedAt: new Date().toISOString()
@@ -271,7 +288,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Scene & Characters Parsing
+    // Scene, Characters & Thoughts Parsing
     // ---------------------------------------------------------------------
 
     function parseSceneBlock(text) {
@@ -333,6 +350,28 @@
         return { characters, spatialPos };
     }
 
+    function parseThoughtBlock(text) {
+        if (!text) return null;
+        const blockMatch = String(text).match(THOUGHT_BLOCK_RE);
+        if (!blockMatch) return null;
+        
+        const content = blockMatch[1];
+        const thoughts = [];
+        const lines = content.split('\n');
+        for (const line of lines) {
+            const m = line.match(/^\s*([^:]+):\s*(.*)$/);
+            if (m && m[2].trim()) {
+                thoughts.push({ 
+                    name: cleanName(m[1]), 
+                    text: cleanName(m[2]).slice(0, 600) 
+                });
+            }
+        }
+        
+        if (!thoughts.length) return null;
+        return { thoughts };
+    }
+
     function getCurrentScene() {
         const ctx = getContext();
         const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
@@ -366,6 +405,7 @@
         let result = text;
         if (settings().trackSceneModule) result = result.replace(STRIP_SCENE_RE, '');
         if (settings().trackCharacterModule) result = result.replace(STRIP_CHAR_RE, '');
+        if (settings().trackThoughtsModule) result = result.replace(STRIP_THOUGHT_RE, '');
         return result.trim();
     }
 
@@ -380,7 +420,7 @@
         savedChatMessages = [];
         for (let i = 0; i < limit; i++) {
             const mes = ctx.chat[i];
-            if (mes && mes.mes && (mes.mes.includes(SCENE_BLOCK_MARKER) || mes.mes.includes(CHAR_BLOCK_MARKER))) {
+            if (mes && mes.mes && (mes.mes.includes(SCENE_BLOCK_MARKER) || mes.mes.includes(CHAR_BLOCK_MARKER) || mes.mes.includes(THOUGHT_BLOCK_MARKER))) {
                 savedChatMessages.push({ index: i, original: mes.mes });
                 mes.mes = stripBlocksFromText(mes.mes);
             }
@@ -406,7 +446,6 @@
 
     function buildSystemInjection(state) {
         const scene = getCurrentScene() || state.scene || {};
-        const charData = getCurrentCharacters() || {};
         const fmt = (v) => (v && String(v).trim()) ? String(v).trim() : 'неизвестно';
         
         let prompt = `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блоки актуального состояния строго в следующем формате. Заполняй все поля. Если значение не изменилось — повтори предыдущее. Если данных нет — пиши «неизвестно» или «Без одежды». Не выдумывай данные без основания в тексте.\n\n`;
@@ -451,6 +490,21 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
 `;
         }
 
+        if (settings().trackThoughtsModule) {
+            prompt += `${THOUGHT_BLOCK_MARKER}
+<выведи скрытые мысли присутствующих персонажей>
+Имя: <скрытые мысли, страхи, желания, которые персонаж не озвучивает>
+Имя2: <...>
+
+Правила обновления мыслей:
+- Отражай текущие мысли персонажей в текущей сцене.
+- Скрытые мысли должны отличаться от произнесённого вслух.
+- Не выводи мысли {{user}}, если он не управляется ИИ.
+${state.excludeMainCharacter ? `- ВАЖНО: Пропусти мысли ${getActiveNames().mainName} (нейтральный рассказчик). Не добавляй его в список.` : ''}
+
+`;
+        }
+
         prompt += `]`;
         return prompt;
     }
@@ -462,7 +516,7 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
         const roles = ctx.extension_prompt_roles || { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
         const state = getState();
         
-        if ((!settings().trackSceneModule && !settings().trackCharacterModule) || !state) {
+        if ((!settings().trackSceneModule && !settings().trackCharacterModule && !settings().trackThoughtsModule) || !state) {
             try {
                 ctx.setExtensionPrompt(SCENE_PROMPT_KEY, '', types.IN_CHAT, 0, false, roles.SYSTEM);
             } catch (_) { /* noop */ }
@@ -492,10 +546,14 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
             const charRe = /(?:<p>\s*)?---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
             result = result.replace(charRe, '');
         }
+        if (settings().trackThoughtsModule) {
+            const thoughtRe = /(?:<p>\s*)?---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
+            result = result.replace(thoughtRe, '');
+        }
         return result;
     }
 
-    function syncBlocksToState(messageId, parsedScene, parsedChars) {
+    function syncBlocksToState(messageId, parsedScene, parsedChars, parsedThoughts) {
         const state = getState();
         if (!state) return;
         
@@ -507,6 +565,11 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
         if (parsedChars) {
             if (!state.charactersByMessageIndex) state.charactersByMessageIndex = {};
             state.charactersByMessageIndex[String(messageId)] = { ...parsedChars };
+        }
+
+        if (parsedThoughts) {
+            if (!state.thoughtsByMessageIndex) state.thoughtsByMessageIndex = {};
+            state.thoughtsByMessageIndex[String(messageId)] = { ...parsedThoughts };
         }
         
         scheduleSilentSave();
@@ -533,7 +596,7 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
 Отношения НАПРАВЛЕННЫЕ: A->B не означает B->A. Предлагай небольшие изменения только при наличии конкретного межличностного события. Вежливость сама по себе не означает доверие или симпатию. Если изменений нет — interactions=[].
 Метрика attraction означает НЕСЕКСУАЛЬНОЕ межличностное стремление к сближению. Отличай её от affection и attachment. Не выводи сексуальное желание и не делай о нём предположений.
 Новые сущности должны иметь имя, тип npc/user/main_character и aliases. Имена новых сущностей должны встречаться в тексте фрагмента.
-Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence. Также укажи status — краткое естественное описание отношений на русском.
+Для каждой связи укажи source, target, изменения-дельты от -20 до +20, confidence от 0 до 1, reason и evidence. Также укажи status — краткое естественное описание отношений на русском.
 Не создавай отношения персонажа с самим собой. Не делай массовые изменения без отдельного основания.
 ${state.excludeMainCharacter ? `ВАЖНО: ${getActiveNames().mainName} — нейтральный рассказчик, не участник истории. Не добавляй его как сущность и не создавай отношения от его имени или к нему.` : ''}
 
@@ -552,7 +615,7 @@ ${body}
 Верни только JSON:
 {"entities":[{"name":"...","type":"npc","aliases":[]}],
 "interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}]}
-Допустимые метрики: ${METRICS.join(', ')}. attraction = не сексуальное желание близости/сближения. Не указывай метрики без изменений.`;
+Допустимые метрики: ${METRICS.join(', ')}. Шкала метрик: 0-200 (100 = нейтрально, 0 = минимум, 200 = максимум). attraction = не сексуальное желание близости/сближения. Не указывай метрики без изменений.`;
     }
 
     function parseJson(raw) {
@@ -573,20 +636,20 @@ ${body}
     }
 
     function deriveStatus(scores) {
-        if (scores.trust <= 20 || scores.irritation >= 80) return 'hostile';
-        if (scores.fear >= 75) return 'intimidated';
-        if (scores.attachment >= 80 && scores.affection >= 70) return 'deeply_bonded';
-        if (scores.affection >= 70 && scores.trust >= 65) return 'close';
-        if (scores.respect >= 70 && scores.trust >= 55) return 'allies';
-        if (scores.irritation >= 60) return 'strained';
-        if (scores.trust >= 60 || scores.affection >= 60) return 'friendly';
+        if (scores.trust <= 40 || scores.irritation >= 160) return 'hostile';
+        if (scores.fear >= 150) return 'intimidated';
+        if (scores.attachment >= 160 && scores.affection >= 140) return 'deeply_bonded';
+        if (scores.affection >= 140 && scores.trust >= 130) return 'close';
+        if (scores.respect >= 140 && scores.trust >= 110) return 'allies';
+        if (scores.irritation >= 120) return 'strained';
+        if (scores.trust >= 120 || scores.affection >= 120) return 'friendly';
         return 'acquaintances';
     }
 
     function applyAnalysis(result, transcript, state) {
         const cfg = settings();
         const floor = Number(cfg.minConfidence) || 0.68;
-        const maxDelta = Number(cfg.maxDeltaPerEvent) || 8;
+        const maxDelta = Number(cfg.maxDeltaPerEvent) || 16;
         const nameMap = new Map();
 
         const active = getActiveNames();
@@ -630,7 +693,7 @@ ${body}
                 if (!(metric in (item.changes || {}))) continue;
                 const delta = clampDelta(item.changes[metric], maxDelta);
                 if (!delta) continue;
-                relation.scores[metric] = clampScore((relation.scores[metric] ?? 50) + delta);
+                relation.scores[metric] = clampScore((relation.scores[metric] ?? 100) + delta);
                 deltas[metric] = delta;
             }
             const proposedStatus = cleanName(item.status || '').slice(0, 180);
@@ -690,7 +753,7 @@ ${body}
         for (const r of relations) {
             const a = state.entities[r.sourceId]?.name || r.sourceId;
             const b = state.entities[r.targetId]?.name || r.targetId;
-            const values = METRICS.map(m => `${LABELS[m]} ${r.scores[m] ?? 50}/100`).join('; ');
+            const values = METRICS.map(m => `${LABELS[m]} ${r.scores[m] ?? 100}/200`).join('; ');
             lines.push(`- ${a} → ${b}: ${r.statusDescription || r.status}. ${values}.`);
         }
         if (!relations.length) lines.push('- Пока нет подтверждённых изменений отношений.');
@@ -710,6 +773,7 @@ ${body}
         const response = await fetch(`/api/worldinfo/${endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
             body: JSON.stringify(body)
         });
         if (!response.ok) throw new Error(`World Info API ${endpoint}: HTTP ${response.status}`);
@@ -782,7 +846,7 @@ ${body}
             await worldInfoRequest('edit', { name: state.targetLorebook, data: book });
             state.lorebookEntryUid = uid;
             state.lastLorebookSyncAt = new Date().toISOString();
-            await saveState();
+            await saveState(false);
             if (showToast) toast(`Отношения сохранены в Lorebook «${state.targetLorebook}».`);
             return true;
         } catch (err) {
@@ -854,7 +918,7 @@ ${body}
         select.value = books.some(b => b.file_id === current) ? current : '';
         if (current && !select.value) {
             const state = getState();
-            if (state) { state.targetLorebook = ''; await saveState(); }
+            if (state) { state.targetLorebook = ''; await saveState(false); }
         }
     }
 
@@ -901,8 +965,24 @@ ${body}
         </div>`;
     }
 
+    function thoughtFooterMarkup(thoughtData) {
+        if (!settings().trackThoughtsModule || !thoughtData || !thoughtData.thoughts?.length) return '';
+        
+        let parts = thoughtData.thoughts.map(t => `
+            <div class="dr-thought-entry">
+                <div class="dr-thought-name">${escapeHtml(t.name)}</div>
+                <div class="dr-thought-text">${escapeHtml(t.text)}</div>
+            </div>
+        `);
+
+        return `<div class="dr-thought-footer">
+            <div class="dr-thought-title">--- ✧ 💭 ВНУТРЕННИЙ МОНОЛОГ ✧ ---</div>
+            <div class="dr-thought-list">${parts.join('')}</div>
+        </div>`;
+    }
+
     function refreshFooters() {
-        document.querySelectorAll('#chat .dr-scene-footer, #chat .dr-char-footer, #chat .dr-scene-placeholder').forEach(el => el.remove());
+        document.querySelectorAll('#chat .dr-scene-footer, #chat .dr-char-footer, #chat .dr-thought-footer, #chat .dr-scene-placeholder').forEach(el => el.remove());
         const ctx = getContext();
         document.querySelectorAll('#chat .mes[mesid]').forEach(mesEl => {
             const id = Number(mesEl.getAttribute('mesid'));
@@ -921,6 +1001,10 @@ ${body}
             if (settings().trackCharacterModule) {
                 const chars = parseCharacterBlock(messageText(mes));
                 if (chars) htmlToAdd += characterFooterMarkup(chars);
+            }
+            if (settings().trackThoughtsModule) {
+                const thoughts = parseThoughtBlock(messageText(mes));
+                if (thoughts) htmlToAdd += thoughtFooterMarkup(thoughts);
             }
             
             if (htmlToAdd) textEl.insertAdjacentHTML('beforeend', htmlToAdd);
@@ -942,6 +1026,7 @@ ${body}
                 const text = messageText(mes);
                 let scene = null;
                 let chars = null;
+                let thoughts = null;
                 let shouldProcess = false;
 
                 if (settings().trackSceneModule) {
@@ -952,15 +1037,20 @@ ${body}
                     chars = parseCharacterBlock(text);
                     if (chars) shouldProcess = true;
                 }
+                if (settings().trackThoughtsModule) {
+                    thoughts = parseThoughtBlock(text);
+                    if (thoughts) shouldProcess = true;
+                }
                 
                 if (!shouldProcess) return html;
                 
-                try { syncBlocksToState(messageId, scene, chars); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
+                try { syncBlocksToState(messageId, scene, chars, thoughts); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
                 
                 let stripped = stripBlocksFromHtml(html);
                 let footers = '';
                 if (scene) footers += sceneFooterMarkup(scene);
                 if (chars) footers += characterFooterMarkup(chars);
+                if (thoughts) footers += thoughtFooterMarkup(thoughts);
                 
                 return stripped + footers;
             }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
@@ -1008,7 +1098,7 @@ ${body}
         excludeInput.checked = !!state.excludeMainCharacter;
         excludeInput.addEventListener('change', async () => {
             state.excludeMainCharacter = excludeInput.checked;
-            await saveState();
+            await saveState(false);
             if (state.targetLorebook) await syncToSelectedLorebook(false);
         });
         const excludeText = document.createElement('span');
@@ -1049,7 +1139,23 @@ ${body}
         });
         charLabel.append(charInput, charText);
 
-        // Настройки вырезания истории
+        const thoughtLabel = document.createElement('label');
+        thoughtLabel.className = 'dr-setting';
+        const thoughtInput = document.createElement('input');
+        thoughtInput.type = 'checkbox';
+        thoughtInput.checked = settings().trackThoughtsModule !== false;
+        const thoughtText = document.createElement('span');
+        thoughtText.textContent = 'Отслеживать внутренний монолог (скрытые мысли)';
+        thoughtInput.addEventListener('change', async () => {
+            settings().trackThoughtsModule = thoughtInput.checked;
+            const ctx = getContext();
+            if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+            updateSystemInjection();
+            refreshFooters();
+            if (state.targetLorebook) await syncToSelectedLorebook(false);
+        });
+        thoughtLabel.append(thoughtInput, thoughtText);
+
         const stripLabel = document.createElement('label');
         stripLabel.className = 'dr-setting';
         const stripInput = document.createElement('input');
@@ -1105,11 +1211,11 @@ ${body}
         loreSelect.addEventListener('change', async () => {
             state.targetLorebook = loreSelect.value;
             state.lorebookEntryUid = null;
-            await saveState();
+            await saveState(false);
             if (state.targetLorebook) await syncToSelectedLorebook(true);
         });
         
-        configBox.append(excludeLabel, sceneLabel, charLabel, stripLabel, keepLabel, loreLabel, refreshBooks);
+        configBox.append(excludeLabel, sceneLabel, charLabel, thoughtLabel, stripLabel, keepLabel, loreLabel, refreshBooks);
         content.append(configBox);
         populateLorebookSelect(loreSelect, state.targetLorebook);
 
@@ -1121,10 +1227,9 @@ ${body}
         info.textContent = `${visibleEntityCount} участников · ${visibleRelationCount} направленных связей · ${state.journal.length} записей журнала`;
         content.append(info);
 
-        // --- Связи (Collapsible) ---
         const relsBox = document.createElement('details');
         relsBox.className = 'dr-collapsible';
-        relsBox.open = true; // По умолчанию раскрыто
+        relsBox.open = true;
         const relsSummary = document.createElement('summary');
         relsSummary.textContent = `Текущие связи (${visibleRelationCount})`;
         relsBox.append(relsSummary);
@@ -1149,11 +1254,12 @@ ${body}
                     const row = document.createElement('div');
                     row.className = 'dr-metric';
                     const label = document.createElement('span');
-                    label.textContent = `${LABELS[metric]}: ${r.scores[metric] ?? 50}`;
+                    label.textContent = `${LABELS[metric]}: ${r.scores[metric] ?? 100}`;
                     const bar = document.createElement('div');
                     bar.className = 'dr-bar';
                     const fill = document.createElement('i');
-                    fill.style.width = `${clampScore(r.scores[metric] ?? 50)}%`;
+                    // Делим на 2, чтобы шкала 0-200 корректно отображалась на 0-100% ширины
+                    fill.style.width = `${Math.min(100, Math.max(0, clampScore(r.scores[metric] ?? 100) / 2))}%`;
                     bar.append(fill);
                     row.append(label, bar);
                     card.append(row);
@@ -1163,7 +1269,6 @@ ${body}
         }
         content.append(relsBox);
 
-        // --- Участники (Collapsible) ---
         const entityBox = document.createElement('details');
         entityBox.className = 'dr-collapsible';
         const summary = document.createElement('summary');
@@ -1176,7 +1281,6 @@ ${body}
         }
         content.append(entityBox);
 
-        // --- Журнал (Collapsible) ---
         const journalBox = document.createElement('details');
         journalBox.className = 'dr-collapsible';
         const journalSummary = document.createElement('summary');
@@ -1203,7 +1307,7 @@ ${body}
         const relation = state.relationships[`${entry.sourceId}__to__${entry.targetId}`];
         if (relation) {
             for (const [metric, delta] of Object.entries(entry.deltas)) {
-                relation.scores[metric] = clampScore((relation.scores[metric] ?? 50) - delta);
+                relation.scores[metric] = clampScore((relation.scores[metric] ?? 100) - delta);
             }
             relation.status = deriveStatus(relation.scores);
             if (entry.previousStatusDescription) relation.statusDescription = entry.previousStatusDescription;
@@ -1331,7 +1435,7 @@ ${body}
         registerMessageFormatter();
         bindEvents();
         updateSystemInjection();
-        log(`Loaded v${VERSION}. Context stripper enabled.`);
+        log(`Loaded v${VERSION}. Metric scale 0-200 enabled.`);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
