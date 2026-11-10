@@ -1,4 +1,4 @@
-/* Dynamic Relationships 0.3.0
+/* Dynamic Relationships 0.4.0
  * Chat-scoped relationship database + generated lorebook projection.
  * SillyTavern UI extension; no external dependencies.
  */
@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.3.0';
+    const VERSION = '0.4.0';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -59,6 +59,8 @@
             excludeMainCharacter: false,
             targetLorebook: '',
             lorebookEntryUid: null,
+            scene: { time: '', weather: '', location: '', updatedAt: null },
+            sceneByMessageIndex: {},
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
@@ -74,10 +76,13 @@
         state.excludeMainCharacter ??= false;
         state.targetLorebook ??= '';
         state.lorebookEntryUid ??= null;
+        state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
+        state.sceneByMessageIndex ??= {};
         for (const rel of Object.values(state.relationships)) {
             rel.scores ??= {};
             for (const metric of METRICS) rel.scores[metric] = clampScore(rel.scores[metric] ?? 50);
             rel.status ??= 'acquaintances';
+            rel.statusDescription ??= 'Знакомство';
         }
         state.schemaVersion = 2;
         return state;
@@ -170,6 +175,7 @@
             targetId: target.id,
             scores: Object.fromEntries(METRICS.map(m => [m, 50])),
             status: 'acquaintances',
+            statusDescription: 'Знакомство',
             updatedAt: new Date().toISOString()
         };
         return state.relationships[key];
@@ -227,7 +233,7 @@
 Отношения НАПРАВЛЕННЫЕ: A->B не означает B->A. Предлагай небольшие изменения только при наличии конкретного межличностного события. Вежливость сама по себе не означает доверие или симпатию. Если изменений нет — interactions=[].
 Метрика attraction означает НЕСЕКСУАЛЬНОЕ межличностное стремление к сближению: желание проводить время вместе, искать внимания и контакта, сокращать эмоциональную дистанцию. Отличай её от affection (положительная симпатия) и attachment (устойчивая эмоциональная привязанность). Не выводи сексуальное желание, не делай предположений о нём и не описывай его. Рост attraction может сочетаться с доверием или недоверием, симпатией или раздражением. Учитывай давление, навязчивое сближение и манипулятивное чередование сближения/отдаления только при явных свидетельствах в тексте; стремление к близости само по себе не означает манипуляцию.
 Новые сущности должны иметь имя, тип npc/user/main_character и aliases. Имена новых сущностей должны встречаться в тексте фрагмента (имя или однозначный псевдоним).
-Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence — короткое подтверждение из фрагмента.
+Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence — короткое подтверждение из фрагмента. Также укажи status — краткое естественное описание отношений на русском (например: «союзники / взаимное уважение», «наставник и ученица / напряжённое доверие», «соперники / вынужденное сотрудничество»). Не добавляй романтические или интимные характеристики без прямого основания в тексте.
 Не создавай отношения персонажа с самим собой. Не делай массовые изменения всем участникам без отдельного основания.
 ${state.excludeMainCharacter ? `ВАЖНО: ${getActiveNames().mainName} — нейтральный рассказчик, не участник истории. Не добавляй его как сущность и не создавай отношения от его имени или к нему.` : ''}
 
@@ -237,15 +243,20 @@ ${known}
 Текущие направленные отношения:
 ${JSON.stringify(edges)}
 
+Текущее состояние сцены (не выдумывай отсутствующие данные):
+${JSON.stringify(state.scene || {})}
+
 Имена пользователя и основного персонажа:
 ${JSON.stringify(getActiveNames())}
 
 Фрагмент переписки:
 ${body}
 
+Для сцены верни объект scene с полями time, weather, location. Обновляй поле только если оно явно присутствует или однозначно следует из текущего фрагмента. Не выдумывай точные часы, дату, погоду или место. Если поле не изменилось или неизвестно, верни null. Время — внутриигровое, не системное время компьютера.
 Верни только JSON:
 {"entities":[{"name":"...","type":"npc","aliases":[]}],
-"interactions":[{"source":"...","target":"...","changes":{"trust":2},"reason":"...","evidence":"...","confidence":0.9}]}
+"interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}],
+"scene":{"time":null,"weather":null,"location":null}}
 Допустимые метрики: ${METRICS.join(', ')}. attraction = не сексуальное желание близости/сближения. Не указывай метрики без изменений.`;
     }
 
@@ -329,12 +340,15 @@ ${body}
                 relation.scores[metric] = clampScore((relation.scores[metric] ?? 50) + delta);
                 deltas[metric] = delta;
             }
-            if (!Object.keys(deltas).length) continue;
+            const proposedStatus = cleanName(item.status || '').slice(0, 180);
+            const statusChanged = !!proposedStatus && proposedStatus !== relation.statusDescription;
+            if (!Object.keys(deltas).length && !statusChanged) continue;
             relation.status = deriveStatus(relation.scores);
+            if (statusChanged) relation.statusDescription = proposedStatus;
             relation.updatedAt = new Date().toISOString();
             const entry = {
                 id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                sourceId: source.id, targetId: target.id, deltas,
+                sourceId: source.id, targetId: target.id, deltas, previousStatusDescription: statusChanged ? (relation.statusDescription || 'Знакомство') : null, statusDescription: statusChanged ? proposedStatus : null,
                 reason: String(item.reason || 'Изменение отношений').slice(0, 240),
                 evidence: String(item.evidence || '').slice(0, 240),
                 confidence, timestamp: new Date().toISOString(),
@@ -353,6 +367,23 @@ ${body}
             const removable = entities.filter(e => !protectedIds.has(e.id)).sort((a,b) => String(a.lastSeenAt).localeCompare(String(b.lastSeenAt)));
             while (Object.keys(state.entities).length > maxEntities && removable.length) delete state.entities[removable.shift().id];
         }
+        const assistantMessage = [...transcript].reverse().find(m => m.role === 'character');
+        if (assistantMessage) {
+            state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
+            const proposedScene = result.scene && typeof result.scene === 'object' ? result.scene : {};
+            let sceneChanged = false;
+            for (const field of ['time', 'weather', 'location']) {
+                const value = cleanName(proposedScene[field] ?? '').slice(0, 220);
+                if (value && value !== state.scene[field]) {
+                    state.scene[field] = value;
+                    sceneChanged = true;
+                }
+            }
+            if (sceneChanged) state.scene.updatedAt = new Date().toISOString();
+            state.sceneByMessageIndex[String(assistantMessage.index)] = { ...state.scene };
+            const keys = Object.keys(state.sceneByMessageIndex).map(Number).sort((a,b) => a-b);
+            for (const key of keys.slice(0, Math.max(0, keys.length - 500))) delete state.sceneByMessageIndex[String(key)];
+        }
         return applied;
     }
 
@@ -368,12 +399,17 @@ ${body}
             'УЧАСТНИКИ:'
         ];
         for (const e of entities) lines.push(`- ${e.name} (${e.type})${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`);
+        lines.push('', 'ТЕКУЩАЯ СЦЕНА:');
+        if (state.scene?.time) lines.push(`- Дата и время: ${state.scene.time}`);
+        if (state.scene?.weather) lines.push(`- Погода: ${state.scene.weather}`);
+        if (state.scene?.location) lines.push(`- Локация: ${state.scene.location}`);
+        if (!state.scene?.time && !state.scene?.weather && !state.scene?.location) lines.push('- Пока не определена.');
         lines.push('', 'НАПРАВЛЕННЫЕ ОТНОШЕНИЯ:');
         for (const r of relations) {
             const a = state.entities[r.sourceId]?.name || r.sourceId;
             const b = state.entities[r.targetId]?.name || r.targetId;
             const values = METRICS.map(m => `${LABELS[m]} ${r.scores[m] ?? 50}/100`).join('; ');
-            lines.push(`- ${a} → ${b}: ${r.status}. ${values}.`);
+            lines.push(`- ${a} → ${b}: ${r.statusDescription || r.status}. ${values}.`);
         }
         if (!relations.length) lines.push('- Пока нет подтверждённых изменений отношений.');
         lines.push('', 'Не делай вывод о взаимности без отдельной записи обратного направления.');
@@ -498,6 +534,8 @@ ${body}
             state.processedExchanges.push(sig);
             state.processedExchanges = state.processedExchanges.slice(-3000);
             await saveState();
+            const latestAssistant = [...transcript].reverse().find(m => m.role === 'character');
+            if (latestAssistant) updateSceneFooter(latestAssistant.index);
             if (state.targetLorebook) await syncToSelectedLorebook(false);
             log(`Exchange analyzed; ${applied.length} directed relationship change(s).`);
         } catch (err) {
@@ -630,7 +668,7 @@ ${body}
             heading.textContent = `${state.entities[r.sourceId]?.name || r.sourceId} → ${state.entities[r.targetId]?.name || r.targetId}`;
             const status = document.createElement('span');
             status.className = 'dr-status';
-            status.textContent = r.status;
+            status.textContent = r.statusDescription || r.status;
             card.append(heading, status);
             for (const metric of METRICS) {
                 const row = document.createElement('div');
@@ -669,8 +707,9 @@ ${body}
             const p = document.createElement('p');
             const a = state.entities[entry.sourceId]?.name || entry.sourceId;
             const b = state.entities[entry.targetId]?.name || entry.targetId;
-            const changes = Object.entries(entry.deltas).map(([k,v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
-            p.textContent = `${a} → ${b}: ${changes}. ${entry.reason}`;
+            const changes = Object.entries(entry.deltas || {}).map(([k,v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
+            const statusNote = entry.statusDescription ? ` Статус: ${entry.statusDescription}.` : '';
+            p.textContent = `${a} → ${b}: ${changes || 'обновление описания отношений'}.${statusNote} ${entry.reason}`;
             journalBox.append(p);
         }
         content.append(journalBox);
@@ -687,6 +726,7 @@ ${body}
                 relation.scores[metric] = clampScore((relation.scores[metric] ?? 50) - delta);
             }
             relation.status = deriveStatus(relation.scores);
+            if (entry.previousStatusDescription) relation.statusDescription = entry.previousStatusDescription;
             relation.updatedAt = new Date().toISOString();
         }
         await saveState();
@@ -722,6 +762,46 @@ ${body}
         a.click();
         URL.revokeObjectURL(url);
         toast('Сформирован JSON-файл управляемой записи. Импортируйте его в World Info.');
+    }
+
+    function sceneForMessage(messageId) {
+        const state = getState();
+        if (!state) return null;
+        return state.sceneByMessageIndex?.[String(messageId)] || null;
+    }
+
+    function sceneFooterMarkup(scene) {
+        if (!scene || ![scene.time, scene.weather, scene.location].some(Boolean)) return '';
+        const parts = [];
+        if (scene.time) parts.push(`<div class="dr-scene-line"><span>⌛</span><span><b>Дата и время:</b> ${escapeHtml(scene.time)}</span></div>`);
+        if (scene.weather) parts.push(`<div class="dr-scene-line"><span>☁️</span><span><b>Погода:</b> ${escapeHtml(scene.weather)}</span></div>`);
+        if (scene.location) parts.push(`<div class="dr-scene-line"><span>✨</span><span><b>Локация:</b> ${escapeHtml(scene.location)}</span></div>`);
+        return `<div class="dr-scene-footer"><div class="dr-scene-title">✧ ТЕКУЩИЙ СЕТТИНГ ✧</div>${parts.join('')}</div>`;
+    }
+
+    function updateSceneFooter(messageId) {
+        const scene = sceneForMessage(messageId);
+        const chat = document.querySelector(`#chat .mes[mesid="${Number(messageId)}"] .mes_text`);
+        if (!chat) return;
+        const existing = chat.querySelector('.dr-scene-footer');
+        const html = sceneFooterMarkup(scene);
+        if (!html) { existing?.remove(); return; }
+        if (existing) existing.outerHTML = html;
+        else chat.insertAdjacentHTML('beforeend', html);
+    }
+
+    function registerMessageFormatter() {
+        const formatter = getContext()?.messageFormatter;
+        if (!formatter?.addHook || registerMessageFormatter.done) return;
+        try {
+            formatter.addHook((html, hookContext) => {
+                if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning || Number(hookContext?.messageId) < 0) return html;
+                const id = Number(hookContext.messageId);
+                const footer = sceneFooterMarkup(sceneForMessage(id));
+                return `${html}${footer || `<div class="dr-scene-placeholder" data-dr-scene="${id}"></div>`}`;
+            }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
+            registerMessageFormatter.done = true;
+        } catch (err) { console.warn(`[${MODULE}] Message formatter registration failed`, err); }
     }
 
     function registerMacro() {
@@ -767,7 +847,8 @@ ${body}
         const ctx = getContext();
         if (!ctx?.eventSource || !ctx?.event_types) return;
         const es = ctx.eventSource, ev = ctx.event_types;
-        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); renderPanel(); });
+        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); renderPanel(); });
+        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, data => { const id = Number(data?.messageId ?? data); if (Number.isInteger(id)) updateSceneFooter(id); });
         if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, scheduleAnalyze);
         if (ev.CHAT_CHANGED) es.on(ev.CHAT_CHANGED, () => {
             busy = false;
@@ -793,6 +874,7 @@ ${body}
         settings();
         mountPanel();
         registerMacro();
+        registerMessageFormatter();
         bindEvents();
         log(`Loaded v${VERSION}. Chat-scoped state and lorebook projection ready.`);
     }

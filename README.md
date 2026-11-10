@@ -1,4 +1,4 @@
-# Dynamic Relationships 0.3.0
+# Dynamic Relationships 0.4.0
 
 Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 
@@ -10,7 +10,7 @@ Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 - Directed/asymmetric relationship edges between the user and story participants (main character tracking can be disabled), including NPC-to-NPC.
 - Metrics: trust, affection, respect, attachment, attraction (non-sexual desire for interpersonal closeness), fear, jealousy, irritation, admiration.
 - Confidence threshold, bounded deltas, evidence/reason logging, and duplicate exchange protection.
-- Relationship status labels derived from scores.
+- Human-readable, multi-part relationship status descriptions (for example, “союзники / взаимное уважение”), alongside the numeric-derived internal status.
 - Undo last applied relationship change.
 - Managed lorebook projection saved alongside chat metadata.
 - `{{dr_relationships}}` macro to insert the current projection into a prompt field that supports macros.
@@ -19,6 +19,7 @@ Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 - Per-chat option to exclude `{{char}}` from relationship tracking (useful for neutral narrator bots).
 - Per-chat selection of an existing World Info / Lorebook for persistence. The extension creates or updates only its own marked entry and preserves the other entries in that book.
 - Automatic update of the selected Lorebook entry after each analysis, plus a manual sync button.
+- Scene tracking for in-story date/time, weather, and location. The extension adds a styled “ТЕКУЩИЙ СЕТТИНГ” footer to assistant messages and includes the latest scene state in the Lorebook projection.
 
 ### Attraction metric
 
@@ -49,7 +50,15 @@ Two additional ways to use the projection:
 
 The JSON export is a snapshot. Export again after subsequent relationship changes if you want a separately imported World Info book to reflect the latest state.
 
-## Important limitations in 0.3.0
+## Scene tracking and message footer
+
+After each assistant reply, the same background analysis request also extracts the current in-story time/date, weather, and location when they are explicitly stated or unambiguously established in the recent transcript. Missing or uncertain fields are left blank; the extension must not invent exact times, weather, or locations. Known scene values carry forward until the story establishes a change. The footer is attached through SillyTavern’s message formatting hook and is presentation-only: it does not rewrite the stored assistant message text.
+
+The scene information is generated from roleplay context, not from the device clock, geolocation, or a live weather service.
+
+Relationship status descriptions are natural-language labels proposed by the model from the transcript (such as “наставник и ученица / тайная связь”). They are separate from the score-derived internal category. Treat them as narrative summaries, not objective psychological diagnoses.
+
+## Important limitations in 0.4.0
 
 - Lorebook saving uses SillyTavern 1.19.0 World Info endpoints (`/api/worldinfo/list`, `/get`, `/edit`). It updates only an entry carrying this extension's chat-specific marker. Test on a backup first; simultaneous edits to the same Lorebook from multiple browser sessions can still cause last-write-wins behavior.
 - `MESSAGE_EDITED`, `MESSAGE_DELETED`, and `MESSAGE_SWIPED` mark the chat as needing reconciliation; this build does not automatically reverse and replay the full journal after a branch/edit. Use Undo for the most recent individual change, or restore a chat backup if a large correction is needed.
@@ -79,7 +88,7 @@ Settings are stored in SillyTavern extension settings under `dynamic_relationshi
 
 ## Compatibility
 
-The manifest declares `minimum_client_version: 1.19.0`. The extension uses documented UI extension facilities including `getContext()`, `chatMetadata`, `saveMetadata()`, `eventSource`, `MESSAGE_RECEIVED`, `CHAT_CHANGED`, `generateRaw()`, and the macro registry where available.
+The manifest declares `minimum_client_version: 1.19.0`. The extension uses documented UI extension facilities including `getContext()`, `chatMetadata`, `saveMetadata()`, `eventSource`, `MESSAGE_RECEIVED`, `CHAT_CHANGED`, `generateRaw()`, the macro registry, and the message formatter hook where available.
 
 Documentation:
 - https://docs.sillytavern.app/for-contributors/writing-extensions/
