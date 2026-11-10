@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.4.1';
+    const VERSION = '0.4.2';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -251,7 +251,12 @@ ${JSON.stringify(getActiveNames())}
 Фрагмент переписки:
 ${body}
 
-${settings().trackSceneModule ? 'Для сцены верни объект scene с полями time, weather, location. Обновляй поле только если оно явно присутствует или однозначно следует из текущего фрагмента. Не выдумывай точные часы, дату, погоду или место. Если поле не изменилось или неизвестно, верни null. Время — внутриигровое, не системное время.' : 'Модуль сеттинга выключен: все поля scene верни null.'}
+${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИЕ ТЕКУЩЕЙ СЦЕНЫ — выполняй при КАЖДОМ новом ответе персонажа, даже если отношения не изменились.
+Сравни текущий фрагмент со старым состоянием сцены и верни ПОЛНЫЙ актуальный снимок всех трёх полей scene:
+- time: внутриигровая дата/время или период суток. Обнови при явном переходе времени («через час», «к вечеру», «на следующее утро», смена даты). Не используй реальное системное время и не придумывай точные часы. Если фрагмент не меняет время, повтори текущее значение.
+- location: текущая физическая локация {{user}}/основной сцены. Если персонаж вышел, вошёл, переместился, прибыл в другое помещение/район/город или сцена явно перенеслась — ОБЯЗАТЕЛЬНО замени старую локацию на новую. Не сохраняй прежнюю локацию после явного перемещения. Если перемещения нет, повтори прежнее значение.
+- weather: погода/условия окружающей среды в текущем месте. Обновляй при изменении погоды или переходе внутрь/наружу, если текст даёт основание. Не выводи погоду из одного лишь факта смены комнаты. Если новых сведений нет, повтори прежнее значение.
+Не возвращай null для неизменившихся полей: повторяй текущее значение из блока «Текущее состояние сцены». Если поле ещё неизвестно и в новом фрагменте нет данных, верни null. Не смешивай старую и новую локацию. Учитывай описательную прозу, действия, диалоги и переходы между сценами.` : 'Модуль сеттинга выключен: все поля scene верни null.'}
 Верни только JSON:
 {"entities":[{"name":"...","type":"npc","aliases":[]}],
 "interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}],
@@ -372,13 +377,24 @@ ${settings().trackSceneModule ? 'Для сцены верни объект scene
             const proposedScene = result.scene && typeof result.scene === 'object' ? result.scene : {};
             let sceneChanged = false;
             for (const field of ['time', 'weather', 'location']) {
-                const value = cleanName(proposedScene[field] ?? '').slice(0, 220);
+                const rawValue = proposedScene[field];
+                // null/undefined means no new evidence; __CLEAR__ explicitly clears a field.
+                if (rawValue === '__CLEAR__') {
+                    if (state.scene[field]) {
+                        state.scene[field] = '';
+                        sceneChanged = true;
+                    }
+                    continue;
+                }
+                if (rawValue === null || rawValue === undefined) continue;
+                const value = cleanName(rawValue).slice(0, 220);
                 if (value && value !== state.scene[field]) {
                     state.scene[field] = value;
                     sceneChanged = true;
                 }
             }
             if (sceneChanged) state.scene.updatedAt = new Date().toISOString();
+            // Store a snapshot for every analyzed assistant message, even when the scene is unchanged.
             state.sceneByMessageIndex[String(assistantMessage.index)] = { ...state.scene };
             const keys = Object.keys(state.sceneByMessageIndex).map(Number).sort((a,b) => a-b);
             for (const key of keys.slice(0, Math.max(0, keys.length - 500))) delete state.sceneByMessageIndex[String(key)];
