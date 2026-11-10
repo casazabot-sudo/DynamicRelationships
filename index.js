@@ -1,6 +1,7 @@
-/* Dynamic Relationships 0.7.1
+/* Dynamic Relationships 0.7.2
  * Chat-scoped relationship database + generated lorebook projection
  * + scene & character tracking + context history stripping.
+ * + collapsible UI sections.
  */
 (() => {
     'use strict';
@@ -10,7 +11,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.7.1';
+    const VERSION = '0.7.2';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -299,12 +300,10 @@
         const content = blockMatch[1];
         const characters = [];
         
-        // Функция для очистки, сохраняющая переносы строк
         const multiLineClean = (v) => {
             return String(v ?? '').split('\n').map(l => l.trim()).filter(Boolean).join('\n').slice(0, 600);
         };
 
-        // Разделяем блок на части по иконкам пола
         const charBlocks = content.split(/(?=(?:♂️|♀️|⚧️))/u);
         
         for (const block of charBlocks) {
@@ -1121,33 +1120,78 @@ ${body}
         info.className = 'dr-muted';
         info.textContent = `${visibleEntityCount} участников · ${visibleRelationCount} направленных связей · ${state.journal.length} записей журнала`;
         content.append(info);
-        
+
+        // --- Связи (Collapsible) ---
+        const relsBox = document.createElement('details');
+        relsBox.className = 'dr-collapsible';
+        relsBox.open = true; // По умолчанию раскрыто
+        const relsSummary = document.createElement('summary');
+        relsSummary.textContent = `Текущие связи (${visibleRelationCount})`;
+        relsBox.append(relsSummary);
+
         const rels = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-        
-        for (const r of rels.slice(0, 50)) {
-            const card = document.createElement('section');
-            card.className = 'dr-relation';
-            const heading = document.createElement('strong');
-            heading.textContent = `${state.entities[r.sourceId]?.name || r.sourceId} → ${state.entities[r.targetId]?.name || r.targetId}`;
-            const status = document.createElement('span');
-            status.className = 'dr-status';
-            status.textContent = r.statusDescription || r.status;
-            card.append(heading, status);
-            for (const metric of METRICS) {
-                const row = document.createElement('div');
-                row.className = 'dr-metric';
-                const label = document.createElement('span');
-                label.textContent = `${LABELS[metric]}: ${r.scores[metric] ?? 50}`;
-                const bar = document.createElement('div');
-                bar.className = 'dr-bar';
-                const fill = document.createElement('i');
-                fill.style.width = `${clampScore(r.scores[metric] ?? 50)}%`;
-                bar.append(fill);
-                row.append(label, bar);
-                card.append(row);
+        if (!rels.length) {
+            const empty = document.createElement('p');
+            empty.className = 'dr-muted';
+            empty.textContent = 'Пока нет отношений. После ответа ИИ будет выполнен фоновый анализ.';
+            relsBox.append(empty);
+        } else {
+            for (const r of rels.slice(0, 50)) {
+                const card = document.createElement('section');
+                card.className = 'dr-relation';
+                const heading = document.createElement('strong');
+                heading.textContent = `${state.entities[r.sourceId]?.name || r.sourceId} → ${state.entities[r.targetId]?.name || r.targetId}`;
+                const status = document.createElement('span');
+                status.className = 'dr-status';
+                status.textContent = r.statusDescription || r.status;
+                card.append(heading, status);
+                for (const metric of METRICS) {
+                    const row = document.createElement('div');
+                    row.className = 'dr-metric';
+                    const label = document.createElement('span');
+                    label.textContent = `${LABELS[metric]}: ${r.scores[metric] ?? 50}`;
+                    const bar = document.createElement('div');
+                    bar.className = 'dr-bar';
+                    const fill = document.createElement('i');
+                    fill.style.width = `${clampScore(r.scores[metric] ?? 50)}%`;
+                    bar.append(fill);
+                    row.append(label, bar);
+                    card.append(row);
+                }
+                relsBox.append(card);
             }
-            content.append(card);
         }
+        content.append(relsBox);
+
+        // --- Участники (Collapsible) ---
+        const entityBox = document.createElement('details');
+        entityBox.className = 'dr-collapsible';
+        const summary = document.createElement('summary');
+        summary.textContent = `Реестр участников (${Object.keys(state.entities).length})`;
+        entityBox.append(summary);
+        for (const e of Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).sort((a, b) => a.name.localeCompare(b.name))) {
+            const p = document.createElement('p');
+            p.textContent = `${e.name} — ${e.type}${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`;
+            entityBox.append(p);
+        }
+        content.append(entityBox);
+
+        // --- Журнал (Collapsible) ---
+        const journalBox = document.createElement('details');
+        journalBox.className = 'dr-collapsible';
+        const journalSummary = document.createElement('summary');
+        journalSummary.textContent = `Последние события (${state.journal.length})`;
+        journalBox.append(journalSummary);
+        for (const entry of state.journal.slice(-15).reverse()) {
+            const p = document.createElement('p');
+            const a = state.entities[entry.sourceId]?.name || entry.sourceId;
+            const b = state.entities[entry.targetId]?.name || entry.targetId;
+            const changes = Object.entries(entry.deltas || {}).map(([k, v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
+            const statusNote = entry.statusDescription ? ` Статус: ${entry.statusDescription}.` : '';
+            p.textContent = `${a} → ${b}: ${changes || 'обновление описания отношений'}.${statusNote} ${entry.reason}`;
+            journalBox.append(p);
+        }
+        content.append(journalBox);
 
         root.querySelector('.dr-count').textContent = `${Object.keys(state.entities).length} участников`;
     }

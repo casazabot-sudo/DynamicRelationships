@@ -21,11 +21,34 @@
     color: var(--SmartThemeBodyColor); background: var(--SmartThemeBlurTintColor);
 }
 #dynamic-relationships-extension button:disabled { opacity: 0.45; cursor: default; }
-#dynamic-relationships-extension .dr-relation,
-#dynamic-relationships-extension .dr-entities,
-#dynamic-relationships-extension .dr-journal {
+
+/* Стили для сворачиваемых блоков (Связи, Участники, Журнал) */
+#dynamic-relationships-extension .dr-collapsible {
     border: 1px solid var(--SmartThemeBorderColor); border-radius: 7px; padding: 0.6rem;
+    margin-top: 0.5rem;
+    background: rgba(0, 0, 0, 0.1);
 }
+#dynamic-relationships-extension .dr-collapsible > summary {
+    font-size: 0.95em;
+    color: var(--SmartThemeEmColor);
+    margin-bottom: 0.5rem;
+}
+#dynamic-relationships-extension .dr-collapsible[open] > summary {
+    margin-bottom: 0.8rem;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    padding-bottom: 0.4rem;
+}
+#dynamic-relationships-extension .dr-collapsible p {
+    margin: 0.4rem 0; font-size: 0.85em;
+}
+
+#dynamic-relationships-extension .dr-relation {
+    border: 1px solid var(--SmartThemeBorderColor); border-radius: 7px; padding: 0.6rem;
+    margin-bottom: 0.5rem;
+    background: var(--SmartThemeBlurTintColor);
+}
+#dynamic-relationships-extension .dr-relation:last-child { margin-bottom: 0; }
+
 #dynamic-relationships-extension .dr-status {
     float: right; opacity: 0.7; font-size: 0.8em; font-weight: 400;
 }
@@ -41,8 +64,6 @@
     display: block; height: 100%; background: var(--SmartThemeEmColor); border-radius: inherit;
 }
 #dynamic-relationships-extension .dr-muted { opacity: 0.7; font-size: 0.88em; margin: 0; }
-#dynamic-relationships-extension .dr-entities p,
-#dynamic-relationships-extension .dr-journal p { margin: 0.4rem 0; font-size: 0.85em; }
 #dynamic-relationships-extension .dr-config {
     display: grid; gap: 0.55rem; padding: 0.65rem;
     border: 1px solid var(--SmartThemeBorderColor); border-radius: 7px;
