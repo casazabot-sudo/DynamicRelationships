@@ -10,7 +10,9 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.4.2';
+    const VERSION = '0.4.3';
+    const SCENE_PROMPT_ID = 'dr_scene_status_instruction';
+    const SCENE_BLOCK_REGEX = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?---\s*(?=\n\s*$|\s*$)/iu;
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -649,6 +651,8 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             const ctx = getContext();
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
             else if (typeof window.saveSettingsDebounced === 'function') window.saveSettingsDebounced();
+            if (sceneInput.checked) injectSceneInstruction();
+            else clearSceneInstruction();
             refreshSceneFooters();
             if (state.targetLorebook) await syncToSelectedLorebook(false);
             toast(sceneInput.checked ? 'Отслеживание сеттинга включено.' : 'Отслеживание сеттинга отключено. Сохранённые данные не удалены.');
@@ -799,6 +803,91 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         toast('Сформирован JSON-файл управляемой записи. Импортируйте его в World Info.');
     }
 
+    function getPreviousSceneForPrompt() {
+        const state = getState();
+        if (!state?.scene) return null;
+        const s = state.scene;
+        if (!s.time && !s.weather && !s.location) return null;
+        return s;
+    }
+
+    function buildSceneInstruction() {
+        if (!settings().trackSceneModule) return '';
+        const prev = getPreviousSceneForPrompt();
+        const prevBlock = prev
+            ? `Предыдущее состояние сцены (обнови при изменениях, иначе повтори):\n⏳ Дата и Время: ${prev.time || 'неизвестно'}\n☁️ Погода: ${prev.weather || 'неизвестно'}\n✨ Локация: ${prev.location || 'неизвестно'}\n`
+            : 'Предыдущего состояния сцены нет. Определи актуальное на основе текущей сцены.\n';
+        return `[System Note: MANDATORY — at the VERY END of your response, output the dynamic status block in EXACT format below. Fill with actual current values based on the scene progression and time passed. Be concise and specific. Update dynamically. Do not invent precise clock times if not established; use descriptive periods if needed. Russian language.
+
+${prevBlock}
+--- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---
+⏳ Дата и Время: [День недели, ДД.ММ.ГГГГ | ЧЧ:ММ or descriptive period]
+☁️ Погода: [Current weather / environmental conditions]
+✨ Локация: [Concrete current location of the scene]
+---
+
+CRITICAL: Output this block at the absolute end. Use the exact emoji and structure. If nothing changed, repeat previous values. If time passed or location/weather shifted in the narrative, update accordingly.]`;
+    }
+
+    function injectSceneInstruction() {
+        const ctx = getContext();
+        if (!ctx?.setExtensionPrompt) return;
+        const content = buildSceneInstruction();
+        // position 1 = IN_CHAT, depth 0 (near the end), role 0 = SYSTEM
+        ctx.setExtensionPrompt(SCENE_PROMPT_ID, content, 1, 0, false, 0);
+    }
+
+    function clearSceneInstruction() {
+        const ctx = getContext();
+        if (!ctx?.setExtensionPrompt) return;
+        ctx.setExtensionPrompt(SCENE_PROMPT_ID, '', 1, 0, false, 0);
+    }
+
+    function parseSceneBlock(text) {
+        if (!text) return null;
+        const m = String(text).match(SCENE_BLOCK_REGEX);
+        if (!m) return null;
+        const block = m[0];
+        const time = (block.match(/⏳\s*Дата\s*и\s*Время:\s*([^\n]+)/i) || [])[1]?.trim() || '';
+        const weather = (block.match(/☁️\s*Погода:\s*([^\n]+)/i) || [])[1]?.trim() || '';
+        const location = (block.match(/✨\s*Локация:\s*([^\n]+)/i) || [])[1]?.trim() || '';
+        if (!time && !weather && !location) return null;
+        return { time, weather, location };
+    }
+
+    function processSceneFromMessage(messageId) {
+        if (!settings().trackSceneModule) return;
+        const ctx = getContext();
+        const state = getState();
+        if (!ctx?.chat || !state || !Number.isInteger(messageId) || messageId < 0) return;
+        const mesObj = ctx.chat[messageId];
+        if (!mesObj || mesObj.is_user || mesObj.is_system) return;
+        const raw = String(mesObj.mes || mesObj.text || '');
+        const parsed = parseSceneBlock(raw);
+        if (!parsed) return;
+
+        let changed = false;
+        for (const field of ['time', 'weather', 'location']) {
+            if (parsed[field] && parsed[field] !== state.scene[field]) {
+                state.scene[field] = parsed[field];
+                changed = true;
+            }
+        }
+        if (changed) state.scene.updatedAt = new Date().toISOString();
+        state.sceneByMessageIndex[String(messageId)] = { ...state.scene };
+
+        // Strip the raw block from stored message so it doesn't pollute future context
+        const cleaned = raw.replace(SCENE_BLOCK_REGEX, '').trim();
+        if (cleaned !== raw) {
+            mesObj.mes = cleaned;
+            if (typeof mesObj.text === 'string') mesObj.text = cleaned;
+            try {
+                if (typeof ctx.saveChat === 'function') ctx.saveChat();
+            } catch (_) { /* ignore save failure */ }
+        }
+        saveState();
+    }
+
     function sceneForMessage(messageId) {
         const state = getState();
         if (!state) return null;
@@ -840,8 +929,10 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
                 if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning || Number(hookContext?.messageId) < 0) return html;
                 if (!settings().trackSceneModule) return html;
                 const id = Number(hookContext.messageId);
+                // Strip raw status block from displayed HTML so only the styled footer remains
+                const cleanedHtml = String(html).replace(SCENE_BLOCK_REGEX, '');
                 const footer = sceneFooterMarkup(sceneForMessage(id));
-                return `${html}${footer || `<div class="dr-scene-placeholder" data-dr-scene="${id}"></div>`}`;
+                return `${cleanedHtml}${footer || `<div class="dr-scene-placeholder" data-dr-scene="${id}"></div>`}`;
             }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
             registerMessageFormatter.done = true;
         } catch (err) { console.warn(`[${MODULE}] Message formatter registration failed`, err); }
@@ -891,12 +982,28 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         if (!ctx?.eventSource || !ctx?.event_types) return;
         const es = ctx.eventSource, ev = ctx.event_types;
         if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); renderPanel(); });
-        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, data => { const id = Number(data?.messageId ?? data); if (Number.isInteger(id)) updateSceneFooter(id); });
+        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, data => {
+            const id = Number(data?.messageId ?? data);
+            if (Number.isInteger(id)) {
+                processSceneFromMessage(id);
+                updateSceneFooter(id);
+            }
+        });
         if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, scheduleAnalyze);
+        if (ev.GENERATION_AFTER_COMMANDS) es.on(ev.GENERATION_AFTER_COMMANDS, () => {
+            if (settings().trackSceneModule) injectSceneInstruction();
+            else clearSceneInstruction();
+        });
+        if (ev.GENERATION_STARTED) es.on(ev.GENERATION_STARTED, () => {
+            if (settings().trackSceneModule) injectSceneInstruction();
+            else clearSceneInstruction();
+        });
         if (ev.CHAT_CHANGED) es.on(ev.CHAT_CHANGED, () => {
             busy = false;
             registerMacro();
             renderPanel();
+            if (settings().trackSceneModule) injectSceneInstruction();
+            else clearSceneInstruction();
         });
         for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED']) {
             if (ev[name]) es.on(ev[name], () => {

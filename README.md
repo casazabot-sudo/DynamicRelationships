@@ -1,4 +1,4 @@
-# Dynamic Relationships 0.4.1
+# Dynamic Relationships 0.4.3
 
 Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 
@@ -19,7 +19,40 @@ Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 - Per-chat option to exclude `{{char}}` from relationship tracking (useful for neutral narrator bots).
 - Per-chat selection of an existing World Info / Lorebook for persistence. The extension creates or updates only its own marked entry and preserves the other entries in that book.
 - Automatic update of the selected Lorebook entry after each analysis, plus a manual sync button.
-- Optional scene tracking for in-story date/time, weather, and location; can be enabled or disabled from the extension panel. When disabled, scene extraction and message footer output stop, while previously collected scene data remains stored. The extension adds a styled “ТЕКУЩИЙ СЕТТИНГ” footer to assistant messages and includes the latest scene state in the Lorebook projection.
+- **Reliable scene tracking (v0.4.3)**: Before every generation the extension injects a mandatory system instruction (via `setExtensionPrompt`) requiring the model to output a fresh “ТЕКУЩИЙ СЕТТИНГ” block at the end of its reply. The extension then parses that block, updates the internal scene state (time / weather / location), stores a per-message snapshot, strips the raw block from the message so it does not pollute future context, and renders a clean styled footer. When the module is disabled the injection is cleared and footers are hidden. This approach is far more reliable than post-hoc analysis alone for dynamic time, weather and location changes.
+
+### Attraction metric
+
+`attraction` tracks a character’s non-sexual interpersonal pull toward another person: seeking contact or attention, wanting to spend time together, and wanting to reduce emotional distance. It is distinct from `affection` (positive liking) and `attachment` (enduring emotional bond). The analyzer must not infer or score sexual desire. Attraction alone is not evidence of manipulation; coercive or manipulative dynamics should be noted only when the transcript provides concrete evidence.
+
+Existing chats are migrated automatically: older relationships receive a neutral starting value of 50 for the new metric.
+
+## Install
+
+1. Make a backup of your SillyTavern folder and test on a disposable chat first.
+2. Extract `DynamicRelationships` from the ZIP.
+3. Copy the folder into:
+   `SillyTavern/data/<your-user-handle>/extensions/DynamicRelationships/`
+4. Reload the SillyTavern page (or restart the server if required by your setup).
+5. Open Extensions and enable **Dynamic Relationships**.
+6. Open a chat and generate a character reply. The extension will issue an additional quiet/raw analysis request after the reply is recorded. Scene tracking is injected into the generation itself.
+
+## Lorebook / World Info workflow
+
+The extension keeps canonical relationship data in the chat's metadata and maintains a managed projection. In the extension panel, choose an existing World Info book under **Lorebook для сохранения**. The extension creates one dedicated entry marked in its `extensions` metadata and updates that entry after each analysis. Other entries in the selected book are preserved. You can also press **Сохранить в Lorebook** to sync manually. Choose **Только внутреннее хранилище чата** to disable writes to a World Info book.
+
+The extension does not delete old managed entries from a book when you change the target book; if you switch destinations, the previous book retains its last saved snapshot.
+
+Two additional ways to use the projection:
+
+1. Add `{{dr_relationships}}` to a prompt field that supports SillyTavern macros. It resolves to the latest managed relationship text for the currently open chat.
+2. In the extension panel, click **Экспорт Lorebook**. Import the generated `Dynamic-Relationships-Lorebook.json` as a World Info book/entry using SillyTavern's World Info import UI.
+
+The JSON export is a snapshot. Export again after subsequent relationship changes if you want a separately imported World Info book to reflect the latest state.
+
+## Scene tracking and message footer
+
+When the scene module is enabled, a styled “✧ ТЕКУЩИЙ СЕТТИНГ ✧” footer appears under assistant messages showing the current in-story date/time, weather and location. The values are taken from the mandatory status block the model is instructed to emit at the end of every reply. Previous scene state is supplied in the injected instruction so the model can update only what changed. The raw block is automatically removed from the stored message text after parsing. Disabling the module stops the injection and hides the footers; previously collected data remains in chat metadata.
 
 ### Attraction metric
 
