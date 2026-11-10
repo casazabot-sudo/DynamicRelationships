@@ -1,4 +1,4 @@
-# Dynamic Relationships 0.4.0
+# Dynamic Relationships 0.4.1
 
 Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 
@@ -19,7 +19,7 @@ Experimental UI extension for SillyTavern. Target baseline: SillyTavern 1.19.0.
 - Per-chat option to exclude `{{char}}` from relationship tracking (useful for neutral narrator bots).
 - Per-chat selection of an existing World Info / Lorebook for persistence. The extension creates or updates only its own marked entry and preserves the other entries in that book.
 - Automatic update of the selected Lorebook entry after each analysis, plus a manual sync button.
-- Scene tracking for in-story date/time, weather, and location. The extension adds a styled “ТЕКУЩИЙ СЕТТИНГ” footer to assistant messages and includes the latest scene state in the Lorebook projection.
+- Optional scene tracking for in-story date/time, weather, and location; can be enabled or disabled from the extension panel. When disabled, scene extraction and message footer output stop, while previously collected scene data remains stored. The extension adds a styled “ТЕКУЩИЙ СЕТТИНГ” footer to assistant messages and includes the latest scene state in the Lorebook projection.
 
 ### Attraction metric
 
@@ -52,13 +52,16 @@ The JSON export is a snapshot. Export again after subsequent relationship change
 
 ## Scene tracking and message footer
 
+The module is controlled by the **Отслеживать сеттинг: дата, время, погода и локация** checkbox in the extension panel. It is enabled by default. When disabled, the analyzer stops extracting scene fields, the footer is hidden (including on already rendered messages), and scene fields are omitted from the Lorebook projection. Previously collected scene values are retained in chat metadata and become available again if the module is re-enabled.
+
+
 After each assistant reply, the same background analysis request also extracts the current in-story time/date, weather, and location when they are explicitly stated or unambiguously established in the recent transcript. Missing or uncertain fields are left blank; the extension must not invent exact times, weather, or locations. Known scene values carry forward until the story establishes a change. The footer is attached through SillyTavern’s message formatting hook and is presentation-only: it does not rewrite the stored assistant message text.
 
 The scene information is generated from roleplay context, not from the device clock, geolocation, or a live weather service.
 
 Relationship status descriptions are natural-language labels proposed by the model from the transcript (such as “наставник и ученица / тайная связь”). They are separate from the score-derived internal category. Treat them as narrative summaries, not objective psychological diagnoses.
 
-## Important limitations in 0.4.0
+## Important limitations in 0.4.1
 
 - Lorebook saving uses SillyTavern 1.19.0 World Info endpoints (`/api/worldinfo/list`, `/get`, `/edit`). It updates only an entry carrying this extension's chat-specific marker. Test on a backup first; simultaneous edits to the same Lorebook from multiple browser sessions can still cause last-write-wins behavior.
 - `MESSAGE_EDITED`, `MESSAGE_DELETED`, and `MESSAGE_SWIPED` mark the chat as needing reconciliation; this build does not automatically reverse and replay the full journal after a branch/edit. Use Undo for the most recent individual change, or restore a chat backup if a large correction is needed.

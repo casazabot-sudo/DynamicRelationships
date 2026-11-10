@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.4.0';
+    const VERSION = '0.4.1';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -26,6 +26,7 @@
         maxEntities: 80,
         maxJournal: 600,
         syncLorebookProjection: true,
+        trackSceneModule: true,
         includeNeutralRelations: false,
         debug: false
     };
@@ -243,16 +244,14 @@ ${known}
 Текущие направленные отношения:
 ${JSON.stringify(edges)}
 
-Текущее состояние сцены (не выдумывай отсутствующие данные):
-${JSON.stringify(state.scene || {})}
-
+${settings().trackSceneModule ? `Текущее состояние сцены (не выдумывай отсутствующие данные):\n${JSON.stringify(state.scene || {})}\n` : 'Модуль отслеживания сеттинга отключён. Не анализируй дату, время, погоду и локацию; верни scene со значениями null.\n'}
 Имена пользователя и основного персонажа:
 ${JSON.stringify(getActiveNames())}
 
 Фрагмент переписки:
 ${body}
 
-Для сцены верни объект scene с полями time, weather, location. Обновляй поле только если оно явно присутствует или однозначно следует из текущего фрагмента. Не выдумывай точные часы, дату, погоду или место. Если поле не изменилось или неизвестно, верни null. Время — внутриигровое, не системное время компьютера.
+${settings().trackSceneModule ? 'Для сцены верни объект scene с полями time, weather, location. Обновляй поле только если оно явно присутствует или однозначно следует из текущего фрагмента. Не выдумывай точные часы, дату, погоду или место. Если поле не изменилось или неизвестно, верни null. Время — внутриигровое, не системное время.' : 'Модуль сеттинга выключен: все поля scene верни null.'}
 Верни только JSON:
 {"entities":[{"name":"...","type":"npc","aliases":[]}],
 "interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}],
@@ -368,7 +367,7 @@ ${body}
             while (Object.keys(state.entities).length > maxEntities && removable.length) delete state.entities[removable.shift().id];
         }
         const assistantMessage = [...transcript].reverse().find(m => m.role === 'character');
-        if (assistantMessage) {
+        if (settings().trackSceneModule && assistantMessage) {
             state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
             const proposedScene = result.scene && typeof result.scene === 'object' ? result.scene : {};
             let sceneChanged = false;
@@ -400,10 +399,12 @@ ${body}
         ];
         for (const e of entities) lines.push(`- ${e.name} (${e.type})${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`);
         lines.push('', 'ТЕКУЩАЯ СЦЕНА:');
-        if (state.scene?.time) lines.push(`- Дата и время: ${state.scene.time}`);
-        if (state.scene?.weather) lines.push(`- Погода: ${state.scene.weather}`);
-        if (state.scene?.location) lines.push(`- Локация: ${state.scene.location}`);
-        if (!state.scene?.time && !state.scene?.weather && !state.scene?.location) lines.push('- Пока не определена.');
+        if (settings().trackSceneModule) {
+            if (state.scene?.time) lines.push(`- Дата и время: ${state.scene.time}`);
+            if (state.scene?.weather) lines.push(`- Погода: ${state.scene.weather}`);
+            if (state.scene?.location) lines.push(`- Локация: ${state.scene.location}`);
+            if (!state.scene?.time && !state.scene?.weather && !state.scene?.location) lines.push('- Пока не определена.');
+        }
         lines.push('', 'НАПРАВЛЕННЫЕ ОТНОШЕНИЯ:');
         for (const r of relations) {
             const a = state.entities[r.sourceId]?.name || r.sourceId;
@@ -620,6 +621,24 @@ ${body}
         excludeText.textContent = 'Не отслеживать {{char}} (нейтральный рассказчик)';
         excludeLabel.append(excludeInput, excludeText);
 
+        const sceneLabel = document.createElement('label');
+        sceneLabel.className = 'dr-setting';
+        const sceneInput = document.createElement('input');
+        sceneInput.type = 'checkbox';
+        sceneInput.checked = settings().trackSceneModule !== false;
+        const sceneText = document.createElement('span');
+        sceneText.textContent = 'Отслеживать сеттинг: дата, время, погода и локация';
+        sceneInput.addEventListener('change', async () => {
+            settings().trackSceneModule = sceneInput.checked;
+            const ctx = getContext();
+            if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+            else if (typeof window.saveSettingsDebounced === 'function') window.saveSettingsDebounced();
+            refreshSceneFooters();
+            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            toast(sceneInput.checked ? 'Отслеживание сеттинга включено.' : 'Отслеживание сеттинга отключено. Сохранённые данные не удалены.');
+        });
+        sceneLabel.append(sceneInput, sceneText);
+
         const loreLabel = document.createElement('label');
         loreLabel.className = 'dr-setting dr-lorebook-setting';
         const loreText = document.createElement('span');
@@ -643,7 +662,7 @@ ${body}
         const loreHint = document.createElement('p');
         loreHint.className = 'dr-muted';
         loreHint.textContent = 'Выбранная книга получает отдельную управляемую запись. Она обновляется после анализа; остальные записи книги сохраняются.';
-        configBox.append(excludeLabel, loreLabel, refreshBooks, loreHint);
+        configBox.append(excludeLabel, sceneLabel, loreLabel, refreshBooks, loreHint);
         content.append(configBox);
         populateLorebookSelect(loreSelect, state.targetLorebook);
 
@@ -771,12 +790,19 @@ ${body}
     }
 
     function sceneFooterMarkup(scene) {
-        if (!scene || ![scene.time, scene.weather, scene.location].some(Boolean)) return '';
+        if (!settings().trackSceneModule || !scene || ![scene.time, scene.weather, scene.location].some(Boolean)) return '';
         const parts = [];
         if (scene.time) parts.push(`<div class="dr-scene-line"><span>⌛</span><span><b>Дата и время:</b> ${escapeHtml(scene.time)}</span></div>`);
         if (scene.weather) parts.push(`<div class="dr-scene-line"><span>☁️</span><span><b>Погода:</b> ${escapeHtml(scene.weather)}</span></div>`);
         if (scene.location) parts.push(`<div class="dr-scene-line"><span>✨</span><span><b>Локация:</b> ${escapeHtml(scene.location)}</span></div>`);
         return `<div class="dr-scene-footer"><div class="dr-scene-title">✧ ТЕКУЩИЙ СЕТТИНГ ✧</div>${parts.join('')}</div>`;
+    }
+
+    function refreshSceneFooters() {
+        document.querySelectorAll('#chat .mes[mesid]').forEach(message => {
+            const id = Number(message.getAttribute('mesid'));
+            if (Number.isInteger(id)) updateSceneFooter(id);
+        });
     }
 
     function updateSceneFooter(messageId) {
@@ -796,6 +822,7 @@ ${body}
         try {
             formatter.addHook((html, hookContext) => {
                 if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning || Number(hookContext?.messageId) < 0) return html;
+                if (!settings().trackSceneModule) return html;
                 const id = Number(hookContext.messageId);
                 const footer = sceneFooterMarkup(sceneForMessage(id));
                 return `${html}${footer || `<div class="dr-scene-placeholder" data-dr-scene="${id}"></div>`}`;
