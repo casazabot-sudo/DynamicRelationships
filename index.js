@@ -1,7 +1,6 @@
-/* Dynamic Relationships 0.8.1
+/* Dynamic Relationships 0.8.2
  * Chat-scoped relationship database + generated lorebook projection
  * + scene, character & thought tracking + context history stripping.
- * + 0-200 metric scale migration.
  */
 (() => {
     'use strict';
@@ -11,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.8.1';
+    const VERSION = '0.8.2';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -23,7 +22,7 @@
         analyzeAutomatically: true,
         contextMessages: 12,
         minConfidence: 0.68,
-        maxDeltaPerEvent: 16, // Увеличено из-за новой шкалы
+        maxDeltaPerEvent: 16, 
         maxEntities: 80,
         maxJournal: 600,
         syncLorebookProjection: true,
@@ -39,17 +38,17 @@
     const SCENE_PROMPT_KEY = 'dynamic_relationships_scene';
     const SCENE_BLOCK_MARKER = '--- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---';
     const CHAR_BLOCK_MARKER = '--- ✧ 🌸 ЗАМЕЧАН ПЕРСОНАЖ ✧ ---';
-    const THOUGHT_BLOCK_MARKER = '--- ✧ 💭 ВНУТРЕННИЙ МОНОЛОГ ✧ ---';
+    const THOUGHT_BLOCK_MARKER = '--- ✧ 💭 ТАЙНЫЕ МЫСЛИ ✧ ---';
 
-    // Регулярки для парсинга (для UI)
+    // Регулярки для парсинга
     const SCENE_BLOCK_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---\s*\n?\s*⌛\s*Дата\s*и\s*Время\s*:\s*([^\n]*)\n?\s*☁️\s*Погода\s*:\s*([^\n]*)\n?\s*✨\s*Локация\s*:\s*([^\n]*)/iu;
     const CHAR_BLOCK_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
-    const THOUGHT_BLOCK_RE = /---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
+    const THOUGHT_BLOCK_RE = /---\s*✧\s*💭\s*ТАЙНЫЕ\s*МЫСЛИ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
 
-    // Регулярки для полного вырезания из контекста
+    // Регулярки для вырезания из контекста
     const STRIP_SCENE_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
     const STRIP_CHAR_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
-    const STRIP_THOUGHT_RE = /---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
+    const STRIP_THOUGHT_RE = /---\s*✧\s*💭\s*ТАЙНЫЕ\s*МЫСЛИ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
 
     let busy = false;
     let registered = false;
@@ -73,7 +72,7 @@
 
     function freshState() {
         return {
-            schemaVersion: 3, // Обновлено для 0-200
+            schemaVersion: 3,
             entities: {},
             relationships: {},
             processedExchanges: [],
@@ -106,7 +105,6 @@
         state.charactersByMessageIndex ??= {};
         state.thoughtsByMessageIndex ??= {};
 
-        // Миграция с 0-100 на 0-200
         if (!state.schemaVersion || state.schemaVersion < 3) {
             for (const rel of Object.values(state.relationships)) {
                 rel.scores ??= {};
@@ -183,6 +181,10 @@
         return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
     }
 
+    function cleanText(value, maxLen = 1000) {
+        return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+    }
+
     function norm(value) {
         return cleanName(value).toLocaleLowerCase();
     }
@@ -244,7 +246,7 @@
         state.relationships[key] ??= {
             sourceId: source.id,
             targetId: target.id,
-            scores: Object.fromEntries(METRICS.map(m => [m, 100])), // Нейтральное значение теперь 100
+            scores: Object.fromEntries(METRICS.map(m => [m, 100])),
             status: 'acquaintances',
             statusDescription: 'Знакомство',
             updatedAt: new Date().toISOString()
@@ -358,16 +360,22 @@
         const content = blockMatch[1];
         const thoughts = [];
         const lines = content.split('\n');
+        let currentThought = null;
+
         for (const line of lines) {
             const m = line.match(/^\s*([^:]+):\s*(.*)$/);
-            if (m && m[2].trim()) {
-                thoughts.push({ 
-                    name: cleanName(m[1]), 
-                    text: cleanName(m[2]).slice(0, 600) 
-                });
+            if (m) {
+                if (currentThought) thoughts.push(currentThought);
+                currentThought = {
+                    name: cleanName(m[1]),
+                    text: cleanText(m[2])
+                };
+            } else if (currentThought && line.trim()) {
+                currentThought.text += '\n' + line.trim();
             }
         }
-        
+        if (currentThought) thoughts.push(currentThought);
+
         if (!thoughts.length) return null;
         return { thoughts };
     }
@@ -448,7 +456,7 @@
         const scene = getCurrentScene() || state.scene || {};
         const fmt = (v) => (v && String(v).trim()) ? String(v).trim() : 'неизвестно';
         
-        let prompt = `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блоки актуального состояния строго в следующем формате. Заполняй все поля. Если значение не изменилось — повтори предыдущее. Если данных нет — пиши «неизвестно» или «Без одежды». Не выдумывай данные без основания в тексте.\n\n`;
+        let prompt = `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блоки актуального состояния строго в следующем формате. Порядок блоков должен быть строго таким: Сеттинг -> Персонажи -> Тайные мысли. Заполняй все поля. Если значение не изменилось — повтори предыдущее. Если данных нет — пиши «неизвестно» или «Без одежды». Не выдумывай данные без основания в тексте.\n\n`;
 
         if (settings().trackSceneModule) {
             prompt += `${SCENE_BLOCK_MARKER}
@@ -547,7 +555,7 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти мысли ${getA
             result = result.replace(charRe, '');
         }
         if (settings().trackThoughtsModule) {
-            const thoughtRe = /(?:<p>\s*)?---\s*✧\s*💭\s*ВНУТРЕННИЙ\s*МОНОЛОГ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
+            const thoughtRe = /(?:<p>\s*)?---\s*✧\s*💭\s*ТАЙНЫЕ\s*МЫСЛИ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
             result = result.replace(thoughtRe, '');
         }
         return result;
@@ -769,13 +777,29 @@ ${body}
         state.lorebookProjection.updatedAt = new Date().toISOString();
     }
 
-    async function worldInfoRequest(endpoint, body = {}) {
-        const response = await fetch(`/api/worldinfo/${endpoint}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify(body)
-        });
+    // Исправление: добавление CSRF-заголовков для работы World Info API
+    async function worldInfoRequest(endpoint, body = null) {
+        const headers = { 'Content-Type': 'application/json' };
+        
+        // Получаем CSRF токен
+        if (typeof window.getRequestHeaders === 'function') {
+            Object.assign(headers, window.getRequestHeaders());
+        } else {
+            const ctx = getContext();
+            if (ctx?.getRequestHeaders) Object.assign(headers, ctx.getRequestHeaders());
+        }
+        
+        const options = {
+            method: body ? 'POST' : 'GET',
+            headers: headers,
+            credentials: 'include'
+        };
+        
+        if (body) {
+            options.body = JSON.stringify(body);
+        }
+
+        const response = await fetch(`/api/worldinfo/${endpoint}`, options);
         if (!response.ok) throw new Error(`World Info API ${endpoint}: HTTP ${response.status}`);
         return response.status === 204 ? null : response.json();
     }
@@ -783,8 +807,9 @@ ${body}
     async function loadLorebookList(force = false) {
         if (lorebookListCache && !force) return lorebookListCache;
         try {
-            const books = await worldInfoRequest('list');
-            lorebookListCache = Array.isArray(books) ? books : [];
+            const response = await worldInfoRequest('list'); // GET запрос без тела
+            const books = Array.isArray(response) ? response : (response?.data || []);
+            lorebookListCache = books;
             return lorebookListCache;
         } catch (err) {
             console.warn(`[${MODULE}] Cannot load World Info list`, err);
@@ -909,13 +934,15 @@ ${body}
         placeholder.value = '';
         placeholder.textContent = 'Только внутреннее хранилище чата';
         select.append(placeholder);
+        
         for (const book of books) {
             const option = document.createElement('option');
-            option.value = book.file_id;
+            option.value = book.file_id || book.name;
             option.textContent = book.name || book.file_id;
             select.append(option);
         }
-        select.value = books.some(b => b.file_id === current) ? current : '';
+        
+        select.value = books.some(b => (b.file_id || b.name) === current) ? current : '';
         if (current && !select.value) {
             const state = getState();
             if (state) { state.targetLorebook = ''; await saveState(false); }
@@ -976,7 +1003,7 @@ ${body}
         `);
 
         return `<div class="dr-thought-footer">
-            <div class="dr-thought-title">--- ✧ 💭 ВНУТРЕННИЙ МОНОЛОГ ✧ ---</div>
+            <div class="dr-thought-title">--- ✧ 💭 ТАЙНЫЕ МЫСЛИ ✧ ---</div>
             <div class="dr-thought-list">${parts.join('')}</div>
         </div>`;
     }
@@ -994,6 +1021,7 @@ ${body}
             if (!textEl) return;
 
             let htmlToAdd = '';
+            // Строгий порядок: Сеттинг -> Персонажи -> Мысли
             if (settings().trackSceneModule) {
                 const scene = parseSceneBlock(messageText(mes));
                 if (scene) htmlToAdd += sceneFooterMarkup(scene);
@@ -1048,6 +1076,7 @@ ${body}
                 
                 let stripped = stripBlocksFromHtml(html);
                 let footers = '';
+                // Строгий порядок вывода
                 if (scene) footers += sceneFooterMarkup(scene);
                 if (chars) footers += characterFooterMarkup(chars);
                 if (thoughts) footers += thoughtFooterMarkup(thoughts);
@@ -1145,7 +1174,7 @@ ${body}
         thoughtInput.type = 'checkbox';
         thoughtInput.checked = settings().trackThoughtsModule !== false;
         const thoughtText = document.createElement('span');
-        thoughtText.textContent = 'Отслеживать внутренний монолог (скрытые мысли)';
+        thoughtText.textContent = 'Отслеживать тайные мысли';
         thoughtInput.addEventListener('change', async () => {
             settings().trackThoughtsModule = thoughtInput.checked;
             const ctx = getContext();
@@ -1207,7 +1236,12 @@ ${body}
         loreLabel.append(loreText, loreSelect);
         const refreshBooks = document.createElement('button');
         refreshBooks.textContent = 'Обновить список';
-        refreshBooks.addEventListener('click', async () => { await loadLorebookList(true); await populateLorebookSelect(loreSelect, state.targetLorebook); });
+        refreshBooks.addEventListener('click', async () => { 
+            await loadLorebookList(true); 
+            await populateLorebookSelect(loreSelect, state.targetLorebook); 
+            if (!lorebookListCache?.length) toast('Lorebook не найдены. Создайте книгу в World Info.', 'info');
+        });
+        
         loreSelect.addEventListener('change', async () => {
             state.targetLorebook = loreSelect.value;
             state.lorebookEntryUid = null;
@@ -1258,7 +1292,6 @@ ${body}
                     const bar = document.createElement('div');
                     bar.className = 'dr-bar';
                     const fill = document.createElement('i');
-                    // Делим на 2, чтобы шкала 0-200 корректно отображалась на 0-100% ширины
                     fill.style.width = `${Math.min(100, Math.max(0, clampScore(r.scores[metric] ?? 100) / 2))}%`;
                     bar.append(fill);
                     row.append(label, bar);
@@ -1435,7 +1468,7 @@ ${body}
         registerMessageFormatter();
         bindEvents();
         updateSystemInjection();
-        log(`Loaded v${VERSION}. Metric scale 0-200 enabled.`);
+        log(`Loaded v${VERSION}. Lorebook API fixed. Thoughts renamed.`);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
