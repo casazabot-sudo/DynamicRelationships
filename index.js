@@ -1,5 +1,6 @@
-/* Dynamic Relationships 0.4.0
- * Chat-scoped relationship database + generated lorebook projection.
+/* Dynamic Relationships 0.5.0
+ * Chat-scoped relationship database + generated lorebook projection
+ * + scene block driven by prompt injection & message parsing.
  * SillyTavern UI extension; no external dependencies.
  */
 (() => {
@@ -10,9 +11,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.4.3';
-    const SCENE_PROMPT_ID = 'dr_scene_status_instruction';
-    const SCENE_BLOCK_REGEX = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?---\s*(?=\n\s*$|\s*$)/iu;
+    const VERSION = '0.5.0';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -33,10 +32,15 @@
         debug: false
     };
 
+    const SCENE_PROMPT_KEY = 'dynamic_relationships_scene';
+    const SCENE_BLOCK_MARKER = '--- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---';
+    const SCENE_BLOCK_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---\s*\n?\s*⌛\s*Дата\s*и\s*Время\s*:\s*([^\n]*)\n?\s*☁️\s*Погода\s*:\s*([^\n]*)\n?\s*✨\s*Локация\s*:\s*([^\n]*)/iu;
+
     let busy = false;
     let registered = false;
     let refreshQueued = false;
     let lorebookListCache = null;
+    let silentSaveTimer = null;
 
     const log = (...args) => console[settings()?.debug ? 'debug' : 'log'](`[${MODULE}]`, ...args);
     const getContext = () => window.SillyTavern?.getContext?.();
@@ -105,10 +109,44 @@
         const ctx = getContext();
         const state = getState();
         if (!ctx || !state) return;
+        // Refresh scene cache from actual chat before rebuilding projection.
+        const current = getCurrentScene();
+        if (current) {
+            const prev = state.scene || {};
+            if (prev.time !== current.time || prev.weather !== current.weather || prev.location !== current.location) {
+                state.scene = { ...current, updatedAt: new Date().toISOString() };
+            }
+        }
         state.updatedAt = new Date().toISOString();
         rebuildLorebookProjection(state);
         if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
+        updateSceneInjection();
         renderPanel();
+    }
+
+    async function silentSaveState() {
+        const ctx = getContext();
+        const state = getState();
+        if (!ctx || !state) return;
+        const current = getCurrentScene();
+        if (current) {
+            const prev = state.scene || {};
+            if (prev.time !== current.time || prev.weather !== current.weather || prev.location !== current.location) {
+                state.scene = { ...current, updatedAt: new Date().toISOString() };
+            }
+        }
+        state.updatedAt = new Date().toISOString();
+        rebuildLorebookProjection(state);
+        if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
+        updateSceneInjection();
+    }
+
+    function scheduleSilentSave() {
+        if (silentSaveTimer) return;
+        silentSaveTimer = setTimeout(() => {
+            silentSaveTimer = null;
+            silentSaveState();
+        }, 400);
     }
 
     function cleanName(value) {
@@ -219,6 +257,110 @@
         return { userName, mainName };
     }
 
+    // ---------------------------------------------------------------------
+    // Scene block parsing / derivation / injection
+    // ---------------------------------------------------------------------
+
+    function parseSceneBlock(text) {
+        if (!text) return null;
+        const m = String(text).match(SCENE_BLOCK_RE);
+        if (!m) return null;
+        const clean = (v) => {
+            const s = String(v ?? '').replace(/\s+/g, ' ').trim();
+            if (!s) return '';
+            if (/^[—\-–]+$/.test(s)) return '';
+            if (/^[\(\s]*неизвестно[\)\s]*$/i.test(s)) return '';
+            return s.slice(0, 220);
+        };
+        const time = clean(m[1]);
+        const weather = clean(m[2]);
+        const location = clean(m[3]);
+        if (!time && !weather && !location) return null;
+        return { time, weather, location };
+    }
+
+    function getCurrentScene() {
+        const ctx = getContext();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const mes = chat[i];
+            if (!mes || mes.is_user || mes.is_system) continue;
+            const parsed = parseSceneBlock(messageText(mes));
+            if (parsed) return parsed;
+        }
+        return null;
+    }
+
+    function buildSceneInjection(state) {
+        const scene = getCurrentScene() || state.scene || {};
+        const fmt = (v) => (v && String(v).trim()) ? String(v).trim() : 'неизвестно';
+        return `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блок актуального состояния сцены строго в следующем формате. Заполняй все три поля. Если значение не изменилось — повтори предыдущее. Если данных нет — напиши «неизвестно». Не выдумывай точные данные без основания в тексте.
+
+${SCENE_BLOCK_MARKER}
+⌛ Дата и Время: <текущая внутриигровая дата и время>
+☁️ Погода: <текущие погодные условия>
+✨ Локация: <текущее конкретное место действия>
+
+Предыдущее состояние сцены (обнови при явных изменениях, иначе сохрани):
+⌛ Дата и Время: ${fmt(scene.time)}
+☁️ Погода: ${fmt(scene.weather)}
+✨ Локация: ${fmt(scene.location)}
+
+Правила обновления:
+- time: обновляй при явном переходе времени («через час», «к вечеру», смена даты, «на следующее утро»). Не используй реальные системные часы и не придумывай точные цифры без основания.
+- location: ОБЯЗАТЕЛЬНО заменяй при перемещении персонажа (вошёл, вышел, прибыл, сцена перенеслась). Не сохраняй старую локацию после явного перемещения. Не смешивай старую и новую.
+- weather: обновляй при изменении погоды или переходе внутрь/наружу, если текст даёт основание.
+- Меняй только то, что действительно изменилось в этом ответе. Всё остальное повторяй без изменений.
+]`;
+    }
+
+    function updateSceneInjection() {
+        const ctx = getContext();
+        if (typeof ctx?.setExtensionPrompt !== 'function') return;
+        const types = ctx.extension_prompt_types || { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+        const roles = ctx.extension_prompt_roles || { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
+        const state = getState();
+        if (!settings().trackSceneModule || !state) {
+            try {
+                ctx.setExtensionPrompt(SCENE_PROMPT_KEY, '', types.IN_CHAT, 0, false, roles.SYSTEM);
+            } catch (_) { /* noop */ }
+            return;
+        }
+        const prompt = buildSceneInjection(state);
+        try {
+            ctx.setExtensionPrompt(SCENE_PROMPT_KEY, prompt, types.IN_CHAT, 0, false, roles.SYSTEM);
+        } catch (err) {
+            // Older ST builds may not accept role — try without it.
+            try {
+                ctx.setExtensionPrompt(SCENE_PROMPT_KEY, prompt, types.IN_CHAT, 0, false);
+            } catch (err2) {
+                console.warn(`[${MODULE}] setExtensionPrompt failed`, err2);
+            }
+        }
+    }
+
+    function stripSceneBlockFromHtml(html) {
+        if (!html) return html;
+        const re = /(?:<p>\s*)?---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?✨\s*Локация:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
+        return html.replace(re, '');
+    }
+
+    function syncSceneToState(messageId, parsedScene) {
+        const state = getState();
+        if (!state) return;
+        if (!state.sceneByMessageIndex) state.sceneByMessageIndex = {};
+        state.sceneByMessageIndex[String(messageId)] = { ...parsedScene };
+        const keys = Object.keys(state.sceneByMessageIndex).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+        for (const key of keys.slice(0, Math.max(0, keys.length - 500))) {
+            delete state.sceneByMessageIndex[String(key)];
+        }
+        scheduleSilentSave();
+    }
+
+    // ---------------------------------------------------------------------
+    // Analysis prompt (relationships only)
+    // ---------------------------------------------------------------------
+
     function buildPrompt(transcript, state) {
         const ignoredMain = state.excludeMainCharacter ? norm(getActiveNames().mainName) : '';
         const known = Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).map(e =>
@@ -234,10 +376,10 @@
         return `Ты анализируешь социальную динамику интерактивной истории. Анализируй только факты в приведённом фрагменте.
 Найди упомянутых или действующих NPC, даже если они не являются авторами сообщений. Не создавай персонажей, которых нельзя подтвердить текстом.
 Отношения НАПРАВЛЕННЫЕ: A->B не означает B->A. Предлагай небольшие изменения только при наличии конкретного межличностного события. Вежливость сама по себе не означает доверие или симпатию. Если изменений нет — interactions=[].
-Метрика attraction означает НЕСЕКСУАЛЬНОЕ межличностное стремление к сближению: желание проводить время вместе, искать внимания и контакта, сокращать эмоциональную дистанцию. Отличай её от affection (положительная симпатия) и attachment (устойчивая эмоциональная привязанность). Не выводи сексуальное желание, не делай предположений о нём и не описывай его. Рост attraction может сочетаться с доверием или недоверием, симпатией или раздражением. Учитывай давление, навязчивое сближение и манипулятивное чередование сближения/отдаления только при явных свидетельствах в тексте; стремление к близости само по себе не означает манипуляцию.
-Новые сущности должны иметь имя, тип npc/user/main_character и aliases. Имена новых сущностей должны встречаться в тексте фрагмента (имя или однозначный псевдоним).
-Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence — короткое подтверждение из фрагмента. Также укажи status — краткое естественное описание отношений на русском (например: «союзники / взаимное уважение», «наставник и ученица / напряжённое доверие», «соперники / вынужденное сотрудничество»). Не добавляй романтические или интимные характеристики без прямого основания в тексте.
-Не создавай отношения персонажа с самим собой. Не делай массовые изменения всем участникам без отдельного основания.
+Метрика attraction означает НЕСЕКСУАЛЬНОЕ межличностное стремление к сближению. Отличай её от affection и attachment. Не выводи сексуальное желание и не делай о нём предположений.
+Новые сущности должны иметь имя, тип npc/user/main_character и aliases. Имена новых сущностей должны встречаться в тексте фрагмента.
+Для каждой связи укажи source, target, изменения-дельты от -10 до +10, confidence от 0 до 1, reason и evidence. Также укажи status — краткое естественное описание отношений на русском.
+Не создавай отношения персонажа с самим собой. Не делай массовые изменения без отдельного основания.
 ${state.excludeMainCharacter ? `ВАЖНО: ${getActiveNames().mainName} — нейтральный рассказчик, не участник истории. Не добавляй его как сущность и не создавай отношения от его имени или к нему.` : ''}
 
 Известные участники:
@@ -246,23 +388,15 @@ ${known}
 Текущие направленные отношения:
 ${JSON.stringify(edges)}
 
-${settings().trackSceneModule ? `Текущее состояние сцены (не выдумывай отсутствующие данные):\n${JSON.stringify(state.scene || {})}\n` : 'Модуль отслеживания сеттинга отключён. Не анализируй дату, время, погоду и локацию; верни scene со значениями null.\n'}
 Имена пользователя и основного персонажа:
 ${JSON.stringify(getActiveNames())}
 
 Фрагмент переписки:
 ${body}
 
-${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИЕ ТЕКУЩЕЙ СЦЕНЫ — выполняй при КАЖДОМ новом ответе персонажа, даже если отношения не изменились.
-Сравни текущий фрагмент со старым состоянием сцены и верни ПОЛНЫЙ актуальный снимок всех трёх полей scene:
-- time: внутриигровая дата/время или период суток. Обнови при явном переходе времени («через час», «к вечеру», «на следующее утро», смена даты). Не используй реальное системное время и не придумывай точные часы. Если фрагмент не меняет время, повтори текущее значение.
-- location: текущая физическая локация {{user}}/основной сцены. Если персонаж вышел, вошёл, переместился, прибыл в другое помещение/район/город или сцена явно перенеслась — ОБЯЗАТЕЛЬНО замени старую локацию на новую. Не сохраняй прежнюю локацию после явного перемещения. Если перемещения нет, повтори прежнее значение.
-- weather: погода/условия окружающей среды в текущем месте. Обновляй при изменении погоды или переходе внутрь/наружу, если текст даёт основание. Не выводи погоду из одного лишь факта смены комнаты. Если новых сведений нет, повтори прежнее значение.
-Не возвращай null для неизменившихся полей: повторяй текущее значение из блока «Текущее состояние сцены». Если поле ещё неизвестно и в новом фрагменте нет данных, верни null. Не смешивай старую и новую локацию. Учитывай описательную прозу, действия, диалоги и переходы между сценами.` : 'Модуль сеттинга выключен: все поля scene верни null.'}
 Верни только JSON:
 {"entities":[{"name":"...","type":"npc","aliases":[]}],
-"interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}],
-"scene":{"time":null,"weather":null,"location":null}}
+"interactions":[{"source":"...","target":"...","changes":{"trust":2},"status":"союзники / взаимное уважение","reason":"...","evidence":"...","confidence":0.9}]}
 Допустимые метрики: ${METRICS.join(', ')}. attraction = не сексуальное желание близости/сближения. Не указывай метрики без изменений.`;
     }
 
@@ -316,7 +450,6 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             if (entity) nameMap.set(norm(name), entity);
         }
 
-        // Add speaker entities, including group-chat speakers.
         for (const m of transcript) {
             if (ignoredMainName && norm(m.name) === ignoredMainName) continue;
             if (!nameMap.has(norm(m.name))) {
@@ -325,7 +458,6 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             }
         }
 
-        // Resolve aliases in the model's proposed relationships.
         const applied = [];
         for (const item of (Array.isArray(result.interactions) ? result.interactions : []).slice(0, 80)) {
             if (ignoredMainName && (norm(item?.source) === ignoredMainName || norm(item?.target) === ignoredMainName)) continue;
@@ -354,7 +486,9 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             relation.updatedAt = new Date().toISOString();
             const entry = {
                 id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                sourceId: source.id, targetId: target.id, deltas, previousStatusDescription: statusChanged ? (relation.statusDescription || 'Знакомство') : null, statusDescription: statusChanged ? proposedStatus : null,
+                sourceId: source.id, targetId: target.id, deltas,
+                previousStatusDescription: statusChanged ? (relation.statusDescription || 'Знакомство') : null,
+                statusDescription: statusChanged ? proposedStatus : null,
                 reason: String(item.reason || 'Изменение отношений').slice(0, 240),
                 evidence: String(item.evidence || '').slice(0, 240),
                 confidence, timestamp: new Date().toISOString(),
@@ -370,36 +504,8 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         const entities = Object.values(state.entities);
         if (entities.length > maxEntities) {
             const protectedIds = new Set(Object.values(state.relationships).flatMap(r => [r.sourceId, r.targetId]));
-            const removable = entities.filter(e => !protectedIds.has(e.id)).sort((a,b) => String(a.lastSeenAt).localeCompare(String(b.lastSeenAt)));
+            const removable = entities.filter(e => !protectedIds.has(e.id)).sort((a, b) => String(a.lastSeenAt).localeCompare(String(b.lastSeenAt)));
             while (Object.keys(state.entities).length > maxEntities && removable.length) delete state.entities[removable.shift().id];
-        }
-        const assistantMessage = [...transcript].reverse().find(m => m.role === 'character');
-        if (settings().trackSceneModule && assistantMessage) {
-            state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
-            const proposedScene = result.scene && typeof result.scene === 'object' ? result.scene : {};
-            let sceneChanged = false;
-            for (const field of ['time', 'weather', 'location']) {
-                const rawValue = proposedScene[field];
-                // null/undefined means no new evidence; __CLEAR__ explicitly clears a field.
-                if (rawValue === '__CLEAR__') {
-                    if (state.scene[field]) {
-                        state.scene[field] = '';
-                        sceneChanged = true;
-                    }
-                    continue;
-                }
-                if (rawValue === null || rawValue === undefined) continue;
-                const value = cleanName(rawValue).slice(0, 220);
-                if (value && value !== state.scene[field]) {
-                    state.scene[field] = value;
-                    sceneChanged = true;
-                }
-            }
-            if (sceneChanged) state.scene.updatedAt = new Date().toISOString();
-            // Store a snapshot for every analyzed assistant message, even when the scene is unchanged.
-            state.sceneByMessageIndex[String(assistantMessage.index)] = { ...state.scene };
-            const keys = Object.keys(state.sceneByMessageIndex).map(Number).sort((a,b) => a-b);
-            for (const key of keys.slice(0, Math.max(0, keys.length - 500))) delete state.sceneByMessageIndex[String(key)];
         }
         return applied;
     }
@@ -553,8 +659,6 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             state.processedExchanges.push(sig);
             state.processedExchanges = state.processedExchanges.slice(-3000);
             await saveState();
-            const latestAssistant = [...transcript].reverse().find(m => m.role === 'character');
-            if (latestAssistant) updateSceneFooter(latestAssistant.index);
             if (state.targetLorebook) await syncToSelectedLorebook(false);
             log(`Exchange analyzed; ${applied.length} directed relationship change(s).`);
         } catch (err) {
@@ -567,12 +671,12 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
 
     function toast(message, type = 'info') {
         const ctx = getContext();
-        if (typeof ctx?. toastr?.[type] === 'function') ctx.toastr[type](message);
+        if (typeof ctx?.toastr?.[type] === 'function') ctx.toastr[type](message);
         else console.info(`[${MODULE}] ${message}`);
     }
 
     function escapeHtml(value) {
-        return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
     async function populateLorebookSelect(select, selectedName = '') {
@@ -595,6 +699,61 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             const state = getState();
             if (state) { state.targetLorebook = ''; await saveState(); }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Footer / panel rendering
+    // ---------------------------------------------------------------------
+
+    function sceneFooterMarkup(scene) {
+        if (!settings().trackSceneModule || !scene || ![scene.time, scene.weather, scene.location].some(Boolean)) return '';
+        const parts = [];
+        if (scene.time) parts.push(`<div class="dr-scene-line"><span>⌛</span><span><b>Дата и время:</b> ${escapeHtml(scene.time)}</span></div>`);
+        if (scene.weather) parts.push(`<div class="dr-scene-line"><span>☁️</span><span><b>Погода:</b> ${escapeHtml(scene.weather)}</span></div>`);
+        if (scene.location) parts.push(`<div class="dr-scene-line"><span>✨</span><span><b>Локация:</b> ${escapeHtml(scene.location)}</span></div>`);
+        return `<div class="dr-scene-footer"><div class="dr-scene-title">✧ ТЕКУЩИЙ СЕТТИНГ ✧</div>${parts.join('')}</div>`;
+    }
+
+    function refreshSceneFooters() {
+        const enabled = settings().trackSceneModule;
+        document.querySelectorAll('#chat .dr-scene-footer, #chat .dr-scene-placeholder').forEach(el => el.remove());
+        if (!enabled) return;
+        const ctx = getContext();
+        document.querySelectorAll('#chat .mes[mesid]').forEach(mesEl => {
+            const id = Number(mesEl.getAttribute('mesid'));
+            if (!Number.isInteger(id) || id < 0) return;
+            const mes = ctx?.chat?.[id];
+            if (!mes || mes.is_user || mes.is_system) return;
+            const parsed = parseSceneBlock(messageText(mes));
+            if (!parsed) return;
+            const textEl = mesEl.querySelector('.mes_text');
+            if (!textEl) return;
+            const html = sceneFooterMarkup(parsed);
+            if (html) textEl.insertAdjacentHTML('beforeend', html);
+        });
+    }
+
+    function registerMessageFormatter() {
+        const formatter = getContext()?.messageFormatter;
+        if (!formatter?.addHook || registerMessageFormatter.done) return;
+        try {
+            formatter.addHook((html, hookContext) => {
+                if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning) return html;
+                if (!settings().trackSceneModule) return html;
+                const messageId = Number(hookContext?.messageId);
+                if (!Number.isInteger(messageId) || messageId < 0) return html;
+                const ctx = getContext();
+                const mes = ctx?.chat?.[messageId];
+                if (!mes) return html;
+                const parsed = parseSceneBlock(messageText(mes));
+                if (!parsed) return html;
+                try { syncSceneToState(messageId, parsed); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
+                const stripped = stripSceneBlockFromHtml(html);
+                const footer = sceneFooterMarkup(parsed);
+                return stripped + footer;
+            }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
+            registerMessageFormatter.done = true;
+        } catch (err) { console.warn(`[${MODULE}] Message formatter registration failed`, err); }
     }
 
     function renderPanel() {
@@ -651,8 +810,7 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             const ctx = getContext();
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
             else if (typeof window.saveSettingsDebounced === 'function') window.saveSettingsDebounced();
-            if (sceneInput.checked) injectSceneInstruction();
-            else clearSceneInstruction();
+            updateSceneInjection();
             refreshSceneFooters();
             if (state.targetLorebook) await syncToSelectedLorebook(false);
             toast(sceneInput.checked ? 'Отслеживание сеттинга включено.' : 'Отслеживание сеттинга отключено. Сохранённые данные не удалены.');
@@ -693,7 +851,7 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         info.className = 'dr-muted';
         info.textContent = `${visibleEntityCount} участников · ${visibleRelationCount} направленных связей · ${state.journal.length} записей журнала`;
         content.append(info);
-        const rels = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).sort((a,b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+        const rels = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
         if (!rels.length) {
             const empty = document.createElement('p');
             empty.className = 'dr-muted';
@@ -730,7 +888,7 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         const summary = document.createElement('summary');
         summary.textContent = `Реестр участников (${Object.keys(state.entities).length})`;
         entityBox.append(summary);
-        for (const e of Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).sort((a,b) => a.name.localeCompare(b.name))) {
+        for (const e of Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).sort((a, b) => a.name.localeCompare(b.name))) {
             const p = document.createElement('p');
             p.textContent = `${e.name} — ${e.type}${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`;
             entityBox.append(p);
@@ -746,7 +904,7 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
             const p = document.createElement('p');
             const a = state.entities[entry.sourceId]?.name || entry.sourceId;
             const b = state.entities[entry.targetId]?.name || entry.targetId;
-            const changes = Object.entries(entry.deltas || {}).map(([k,v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
+            const changes = Object.entries(entry.deltas || {}).map(([k, v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
             const statusNote = entry.statusDescription ? ` Статус: ${entry.statusDescription}.` : '';
             p.textContent = `${a} → ${b}: ${changes || 'обновление описания отношений'}.${statusNote} ${entry.reason}`;
             journalBox.append(p);
@@ -803,141 +961,6 @@ ${settings().trackSceneModule ? `ОБЯЗАТЕЛЬНОЕ ОТСЛЕЖИВАНИ
         toast('Сформирован JSON-файл управляемой записи. Импортируйте его в World Info.');
     }
 
-    function getPreviousSceneForPrompt() {
-        const state = getState();
-        if (!state?.scene) return null;
-        const s = state.scene;
-        if (!s.time && !s.weather && !s.location) return null;
-        return s;
-    }
-
-    function buildSceneInstruction() {
-        if (!settings().trackSceneModule) return '';
-        const prev = getPreviousSceneForPrompt();
-        const prevBlock = prev
-            ? `Предыдущее состояние сцены (обнови при изменениях, иначе повтори):\n⏳ Дата и Время: ${prev.time || 'неизвестно'}\n☁️ Погода: ${prev.weather || 'неизвестно'}\n✨ Локация: ${prev.location || 'неизвестно'}\n`
-            : 'Предыдущего состояния сцены нет. Определи актуальное на основе текущей сцены.\n';
-        return `[System Note: MANDATORY — at the VERY END of your response, output the dynamic status block in EXACT format below. Fill with actual current values based on the scene progression and time passed. Be concise and specific. Update dynamically. Do not invent precise clock times if not established; use descriptive periods if needed. Russian language.
-
-${prevBlock}
---- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---
-⏳ Дата и Время: [День недели, ДД.ММ.ГГГГ | ЧЧ:ММ or descriptive period]
-☁️ Погода: [Current weather / environmental conditions]
-✨ Локация: [Concrete current location of the scene]
----
-
-CRITICAL: Output this block at the absolute end. Use the exact emoji and structure. If nothing changed, repeat previous values. If time passed or location/weather shifted in the narrative, update accordingly.]`;
-    }
-
-    function injectSceneInstruction() {
-        const ctx = getContext();
-        if (!ctx?.setExtensionPrompt) return;
-        const content = buildSceneInstruction();
-        // position 1 = IN_CHAT, depth 0 (near the end), role 0 = SYSTEM
-        ctx.setExtensionPrompt(SCENE_PROMPT_ID, content, 1, 0, false, 0);
-    }
-
-    function clearSceneInstruction() {
-        const ctx = getContext();
-        if (!ctx?.setExtensionPrompt) return;
-        ctx.setExtensionPrompt(SCENE_PROMPT_ID, '', 1, 0, false, 0);
-    }
-
-    function parseSceneBlock(text) {
-        if (!text) return null;
-        const m = String(text).match(SCENE_BLOCK_REGEX);
-        if (!m) return null;
-        const block = m[0];
-        const time = (block.match(/⏳\s*Дата\s*и\s*Время:\s*([^\n]+)/i) || [])[1]?.trim() || '';
-        const weather = (block.match(/☁️\s*Погода:\s*([^\n]+)/i) || [])[1]?.trim() || '';
-        const location = (block.match(/✨\s*Локация:\s*([^\n]+)/i) || [])[1]?.trim() || '';
-        if (!time && !weather && !location) return null;
-        return { time, weather, location };
-    }
-
-    function processSceneFromMessage(messageId) {
-        if (!settings().trackSceneModule) return;
-        const ctx = getContext();
-        const state = getState();
-        if (!ctx?.chat || !state || !Number.isInteger(messageId) || messageId < 0) return;
-        const mesObj = ctx.chat[messageId];
-        if (!mesObj || mesObj.is_user || mesObj.is_system) return;
-        const raw = String(mesObj.mes || mesObj.text || '');
-        const parsed = parseSceneBlock(raw);
-        if (!parsed) return;
-
-        let changed = false;
-        for (const field of ['time', 'weather', 'location']) {
-            if (parsed[field] && parsed[field] !== state.scene[field]) {
-                state.scene[field] = parsed[field];
-                changed = true;
-            }
-        }
-        if (changed) state.scene.updatedAt = new Date().toISOString();
-        state.sceneByMessageIndex[String(messageId)] = { ...state.scene };
-
-        // Strip the raw block from stored message so it doesn't pollute future context
-        const cleaned = raw.replace(SCENE_BLOCK_REGEX, '').trim();
-        if (cleaned !== raw) {
-            mesObj.mes = cleaned;
-            if (typeof mesObj.text === 'string') mesObj.text = cleaned;
-            try {
-                if (typeof ctx.saveChat === 'function') ctx.saveChat();
-            } catch (_) { /* ignore save failure */ }
-        }
-        saveState();
-    }
-
-    function sceneForMessage(messageId) {
-        const state = getState();
-        if (!state) return null;
-        return state.sceneByMessageIndex?.[String(messageId)] || null;
-    }
-
-    function sceneFooterMarkup(scene) {
-        if (!settings().trackSceneModule || !scene || ![scene.time, scene.weather, scene.location].some(Boolean)) return '';
-        const parts = [];
-        if (scene.time) parts.push(`<div class="dr-scene-line"><span>⌛</span><span><b>Дата и время:</b> ${escapeHtml(scene.time)}</span></div>`);
-        if (scene.weather) parts.push(`<div class="dr-scene-line"><span>☁️</span><span><b>Погода:</b> ${escapeHtml(scene.weather)}</span></div>`);
-        if (scene.location) parts.push(`<div class="dr-scene-line"><span>✨</span><span><b>Локация:</b> ${escapeHtml(scene.location)}</span></div>`);
-        return `<div class="dr-scene-footer"><div class="dr-scene-title">✧ ТЕКУЩИЙ СЕТТИНГ ✧</div>${parts.join('')}</div>`;
-    }
-
-    function refreshSceneFooters() {
-        document.querySelectorAll('#chat .mes[mesid]').forEach(message => {
-            const id = Number(message.getAttribute('mesid'));
-            if (Number.isInteger(id)) updateSceneFooter(id);
-        });
-    }
-
-    function updateSceneFooter(messageId) {
-        const scene = sceneForMessage(messageId);
-        const chat = document.querySelector(`#chat .mes[mesid="${Number(messageId)}"] .mes_text`);
-        if (!chat) return;
-        const existing = chat.querySelector('.dr-scene-footer');
-        const html = sceneFooterMarkup(scene);
-        if (!html) { existing?.remove(); return; }
-        if (existing) existing.outerHTML = html;
-        else chat.insertAdjacentHTML('beforeend', html);
-    }
-
-    function registerMessageFormatter() {
-        const formatter = getContext()?.messageFormatter;
-        if (!formatter?.addHook || registerMessageFormatter.done) return;
-        try {
-            formatter.addHook((html, hookContext) => {
-                if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning || Number(hookContext?.messageId) < 0) return html;
-                if (!settings().trackSceneModule) return html;
-                const id = Number(hookContext.messageId);
-                // Strip raw status block from displayed HTML so only the styled footer remains
-                const cleanedHtml = String(html).replace(SCENE_BLOCK_REGEX, '');
-                const footer = sceneFooterMarkup(sceneForMessage(id));
-                return `${cleanedHtml}${footer || `<div class="dr-scene-placeholder" data-dr-scene="${id}"></div>`}`;
-            }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
-            registerMessageFormatter.done = true;
-        } catch (err) { console.warn(`[${MODULE}] Message formatter registration failed`, err); }
-    }
-
     function registerMacro() {
         const ctx = getContext();
         if (ctx?.macros?.register && !registered) {
@@ -981,36 +1004,21 @@ CRITICAL: Output this block at the absolute end. Use the exact emoji and structu
         const ctx = getContext();
         if (!ctx?.eventSource || !ctx?.event_types) return;
         const es = ctx.eventSource, ev = ctx.event_types;
-        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); renderPanel(); });
-        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, data => {
-            const id = Number(data?.messageId ?? data);
-            if (Number.isInteger(id)) {
-                processSceneFromMessage(id);
-                updateSceneFooter(id);
-            }
-        });
-        if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, scheduleAnalyze);
-        if (ev.GENERATION_AFTER_COMMANDS) es.on(ev.GENERATION_AFTER_COMMANDS, () => {
-            if (settings().trackSceneModule) injectSceneInstruction();
-            else clearSceneInstruction();
-        });
-        if (ev.GENERATION_STARTED) es.on(ev.GENERATION_STARTED, () => {
-            if (settings().trackSceneModule) injectSceneInstruction();
-            else clearSceneInstruction();
-        });
+        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); updateSceneInjection(); renderPanel(); });
+        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, () => { updateSceneInjection(); });
+        if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, () => { updateSceneInjection(); scheduleAnalyze(); });
         if (ev.CHAT_CHANGED) es.on(ev.CHAT_CHANGED, () => {
             busy = false;
             registerMacro();
+            updateSceneInjection();
             renderPanel();
-            if (settings().trackSceneModule) injectSceneInstruction();
-            else clearSceneInstruction();
         });
-        for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED']) {
+        for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_UPDATED']) {
             if (ev[name]) es.on(ev[name], () => {
-                // Do not silently rewrite history in this release. Flag the chat for a manual fresh analysis.
                 const state = getState();
                 if (state) state.reconciliationNeeded = true;
-                saveState();
+                updateSceneInjection();
+                scheduleSilentSave();
             });
         }
     }
@@ -1026,7 +1034,8 @@ CRITICAL: Output this block at the absolute end. Use the exact emoji and structu
         registerMacro();
         registerMessageFormatter();
         bindEvents();
-        log(`Loaded v${VERSION}. Chat-scoped state and lorebook projection ready.`);
+        updateSceneInjection();
+        log(`Loaded v${VERSION}. Scene module uses prompt injection + message parsing.`);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
