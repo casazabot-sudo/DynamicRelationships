@@ -1,7 +1,6 @@
-/* Dynamic Relationships 0.5.0
+/* Dynamic Relationships 0.7.0
  * Chat-scoped relationship database + generated lorebook projection
- * + scene block driven by prompt injection & message parsing.
- * SillyTavern UI extension; no external dependencies.
+ * + scene & character tracking with context history stripping.
  */
 (() => {
     'use strict';
@@ -11,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.5.0';
+    const VERSION = '0.7.0';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -28,19 +27,31 @@
         maxJournal: 600,
         syncLorebookProjection: true,
         trackSceneModule: true,
+        trackCharacterModule: true,
+        stripHistoryBlocks: true, // Новая опция
+        keepLastBlocks: 2,        // Новая опция
         includeNeutralRelations: false,
         debug: false
     };
 
     const SCENE_PROMPT_KEY = 'dynamic_relationships_scene';
     const SCENE_BLOCK_MARKER = '--- ✧ ТЕКУЩИЙ СЕТТИНГ ✧ ---';
+    const CHAR_BLOCK_MARKER = '--- ✧ 🌸 ЗАМЕЧАН ПЕРСОНАЖ ✧ ---';
+
+    // Регулярки для парсинга (для UI)
     const SCENE_BLOCK_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---\s*\n?\s*⌛\s*Дата\s*и\s*Время\s*:\s*([^\n]*)\n?\s*☁️\s*Погода\s*:\s*([^\n]*)\n?\s*✨\s*Локация\s*:\s*([^\n]*)/iu;
+    const CHAR_BLOCK_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---\s*([\s\S]*?)(?=(?:\n\s*---)|$)/iu;
+
+    // Регулярки для полного вырезания из контекста
+    const STRIP_SCENE_RE = /---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
+    const STRIP_CHAR_RE = /---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?(?=(?:\n\s*---\s*✧)|$)/giu;
 
     let busy = false;
     let registered = false;
     let refreshQueued = false;
     let lorebookListCache = null;
     let silentSaveTimer = null;
+    let savedChatMessages = null; // Для временного сохранения оригинальных сообщений
 
     const log = (...args) => console[settings()?.debug ? 'debug' : 'log'](`[${MODULE}]`, ...args);
     const getContext = () => window.SillyTavern?.getContext?.();
@@ -68,6 +79,7 @@
             lorebookEntryUid: null,
             scene: { time: '', weather: '', location: '', updatedAt: null },
             sceneByMessageIndex: {},
+            charactersByMessageIndex: {},
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
@@ -85,6 +97,7 @@
         state.lorebookEntryUid ??= null;
         state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
         state.sceneByMessageIndex ??= {};
+        state.charactersByMessageIndex ??= {};
         for (const rel of Object.values(state.relationships)) {
             rel.scores ??= {};
             for (const metric of METRICS) rel.scores[metric] = clampScore(rel.scores[metric] ?? 50);
@@ -109,18 +122,17 @@
         const ctx = getContext();
         const state = getState();
         if (!ctx || !state) return;
-        // Refresh scene cache from actual chat before rebuilding projection.
-        const current = getCurrentScene();
-        if (current) {
+        const currentScene = getCurrentScene();
+        if (currentScene) {
             const prev = state.scene || {};
-            if (prev.time !== current.time || prev.weather !== current.weather || prev.location !== current.location) {
-                state.scene = { ...current, updatedAt: new Date().toISOString() };
+            if (prev.time !== currentScene.time || prev.weather !== currentScene.weather || prev.location !== currentScene.location) {
+                state.scene = { ...currentScene, updatedAt: new Date().toISOString() };
             }
         }
         state.updatedAt = new Date().toISOString();
         rebuildLorebookProjection(state);
         if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
-        updateSceneInjection();
+        updateSystemInjection();
         renderPanel();
     }
 
@@ -128,17 +140,17 @@
         const ctx = getContext();
         const state = getState();
         if (!ctx || !state) return;
-        const current = getCurrentScene();
-        if (current) {
+        const currentScene = getCurrentScene();
+        if (currentScene) {
             const prev = state.scene || {};
-            if (prev.time !== current.time || prev.weather !== current.weather || prev.location !== current.location) {
-                state.scene = { ...current, updatedAt: new Date().toISOString() };
+            if (prev.time !== currentScene.time || prev.weather !== currentScene.weather || prev.location !== currentScene.location) {
+                state.scene = { ...currentScene, updatedAt: new Date().toISOString() };
             }
         }
         state.updatedAt = new Date().toISOString();
         rebuildLorebookProjection(state);
         if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
-        updateSceneInjection();
+        updateSystemInjection();
     }
 
     function scheduleSilentSave() {
@@ -258,7 +270,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // Scene block parsing / derivation / injection
+    // Scene & Characters Parsing
     // ---------------------------------------------------------------------
 
     function parseSceneBlock(text) {
@@ -279,6 +291,33 @@
         return { time, weather, location };
     }
 
+    function parseCharacterBlock(text) {
+        if (!text) return null;
+        const blockMatch = String(text).match(CHAR_BLOCK_RE);
+        if (!blockMatch) return null;
+        
+        const content = blockMatch[1];
+        const characters = [];
+        const charRegex = /(♂️|♀️|⚧️)\s*([^\n(]+)(?:\s*\(([^)]+)\))?\s*\n?\s*Статус:\s*([^\n]*)\n?\s*Одежда:\s*([^\n]*)/giu;
+        
+        let match;
+        while ((match = charRegex.exec(content)) !== null) {
+            characters.push({
+                gender: match[1],
+                name: cleanName(match[2]),
+                role: cleanName(match[3] || ''),
+                status: cleanName(match[4] || '—'),
+                clothes: cleanName(match[5] || '—')
+            });
+        }
+
+        const posMatch = content.match(/🧭\s*Где\s*мы:\s*([^\n]+)/iu);
+        const spatialPos = posMatch ? cleanName(posMatch[1]) : '';
+
+        if (!characters.length && !spatialPos) return null;
+        return { characters, spatialPos };
+    }
+
     function getCurrentScene() {
         const ctx = getContext();
         const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
@@ -291,46 +330,134 @@
         return null;
     }
 
-    function buildSceneInjection(state) {
-        const scene = getCurrentScene() || state.scene || {};
-        const fmt = (v) => (v && String(v).trim()) ? String(v).trim() : 'неизвестно';
-        return `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блок актуального состояния сцены строго в следующем формате. Заполняй все три поля. Если значение не изменилось — повтори предыдущее. Если данных нет — напиши «неизвестно». Не выдумывай точные данные без основания в тексте.
+    function getCurrentCharacters() {
+        const ctx = getContext();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const mes = chat[i];
+            if (!mes || mes.is_user || mes.is_system) continue;
+            const parsed = parseCharacterBlock(messageText(mes));
+            if (parsed) return parsed;
+        }
+        return null;
+    }
 
-${SCENE_BLOCK_MARKER}
+    // ---------------------------------------------------------------------
+    // Context Stripping (History Cleaning for AI)
+    // ---------------------------------------------------------------------
+
+    function stripBlocksFromText(text) {
+        if (!text) return text;
+        let result = text;
+        if (settings().trackSceneModule) result = result.replace(STRIP_SCENE_RE, '');
+        if (settings().trackCharacterModule) result = result.replace(STRIP_CHAR_RE, '');
+        return result.trim();
+    }
+
+    function stripHistoryForGeneration() {
+        if (!settings().stripHistoryBlocks) return;
+        const ctx = getContext();
+        if (!ctx?.chat) return;
+        
+        const keepLast = Math.max(0, Number(settings().keepLastBlocks) || 0);
+        const limit = Math.max(0, ctx.chat.length - keepLast);
+        
+        savedChatMessages = [];
+        for (let i = 0; i < limit; i++) {
+            const mes = ctx.chat[i];
+            if (mes && mes.mes && (mes.mes.includes(SCENE_BLOCK_MARKER) || mes.mes.includes(CHAR_BLOCK_MARKER))) {
+                savedChatMessages.push({ index: i, original: mes.mes });
+                mes.mes = stripBlocksFromText(mes.mes);
+            }
+        }
+    }
+
+    function restoreHistoryAfterGeneration() {
+        if (!savedChatMessages) return;
+        const ctx = getContext();
+        if (!ctx?.chat) return;
+        
+        for (const item of savedChatMessages) {
+            if (ctx.chat[item.index]) {
+                ctx.chat[item.index].mes = item.original;
+            }
+        }
+        savedChatMessages = null;
+    }
+
+    // ---------------------------------------------------------------------
+    // Prompt Injection
+    // ---------------------------------------------------------------------
+
+    function buildSystemInjection(state) {
+        const scene = getCurrentScene() || state.scene || {};
+        const charData = getCurrentCharacters() || {};
+        const fmt = (v) => (v && String(v).trim()) ? String(v).trim() : 'неизвестно';
+        
+        let prompt = `[System Note: ОБЯЗАТЕЛЬНО добавляй в КОНЕЦ КАЖДОГО своего ответа блоки актуального состояния строго в следующем формате. Заполняй все поля. Если значение не изменилось — повтори предыдущее. Если данных нет — пиши «неизвестно» или «Без одежды». Не выдумывай данные без основания в тексте.\n\n`;
+
+        if (settings().trackSceneModule) {
+            prompt += `${SCENE_BLOCK_MARKER}
 ⌛ Дата и Время: <текущая внутриигровая дата и время>
 ☁️ Погода: <текущие погодные условия>
 ✨ Локация: <текущее конкретное место действия>
 
-Предыдущее состояние сцены (обнови при явных изменениях, иначе сохрани):
+Предыдущее состояние сцены (обнови при явных изменениях):
 ⌛ Дата и Время: ${fmt(scene.time)}
 ☁️ Погода: ${fmt(scene.weather)}
 ✨ Локация: ${fmt(scene.location)}
 
-Правила обновления:
-- time: обновляй при явном переходе времени («через час», «к вечеру», смена даты, «на следующее утро»). Не используй реальные системные часы и не придумывай точные цифры без основания.
-- location: ОБЯЗАТЕЛЬНО заменяй при перемещении персонажа (вошёл, вышел, прибыл, сцена перенеслась). Не сохраняй старую локацию после явного перемещения. Не смешивай старую и новую.
-- weather: обновляй при изменении погоды или переходе внутрь/наружу, если текст даёт основание.
-- Меняй только то, что действительно изменилось в этом ответе. Всё остальное повторяй без изменений.
-]`;
+Правила обновления сцены:
+- time: обновляй при явном переходе времени. Не используй реальные часы.
+- location: ОБЯЗАТЕЛЬНО заменяй при перемещении персонажа. Не сохраняй старую локацию.
+- weather: обновляй при изменении погоды или переходе внутрь/наружу.
+
+`;
+        }
+
+        if (settings().trackCharacterModule) {
+            prompt += `${CHAR_BLOCK_MARKER}
+<перечисли всех присутствующих персонажей (включая {{user}}), используя строгий формат для каждого>
+♂️ Имя (Роль)
+Статус: <текущее физическое и эмоциональное состояние>
+Одежда: <детальное описание одежды и её состояния>
+♀️ Имя (Роль)
+Статус: <...>
+Одежда: <...>
+🧭 Где мы: <краткое описание позиции всех присутствующих в пространстве>
+
+Правила обновления персонажей:
+- Используй только иконки ♂️, ♀️ или ⚧️ перед именем.
+- Указывай роль в скобках: (протагонист), (НПС), (антагонист) и т.д.
+- Строго соблюдай формат "Статус:" и "Одежда:" с новой строки. Если персонаж без одежды, пиши "Без одежды".
+- Обновляй позицию в "🧭 Где мы:", если персонажи двигались.
+${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонажа ${getActiveNames().mainName} (нейтральный рассказчик). Не добавляй его в список.` : ''}
+
+`;
+        }
+
+        prompt += `]`;
+        return prompt;
     }
 
-    function updateSceneInjection() {
+    function updateSystemInjection() {
         const ctx = getContext();
         if (typeof ctx?.setExtensionPrompt !== 'function') return;
         const types = ctx.extension_prompt_types || { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
         const roles = ctx.extension_prompt_roles || { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
         const state = getState();
-        if (!settings().trackSceneModule || !state) {
+        
+        if ((!settings().trackSceneModule && !settings().trackCharacterModule) || !state) {
             try {
                 ctx.setExtensionPrompt(SCENE_PROMPT_KEY, '', types.IN_CHAT, 0, false, roles.SYSTEM);
             } catch (_) { /* noop */ }
             return;
         }
-        const prompt = buildSceneInjection(state);
+        
+        const prompt = buildSystemInjection(state);
         try {
             ctx.setExtensionPrompt(SCENE_PROMPT_KEY, prompt, types.IN_CHAT, 0, false, roles.SYSTEM);
         } catch (err) {
-            // Older ST builds may not accept role — try without it.
             try {
                 ctx.setExtensionPrompt(SCENE_PROMPT_KEY, prompt, types.IN_CHAT, 0, false);
             } catch (err2) {
@@ -339,21 +466,34 @@ ${SCENE_BLOCK_MARKER}
         }
     }
 
-    function stripSceneBlockFromHtml(html) {
+    function stripBlocksFromHtml(html) {
         if (!html) return html;
-        const re = /(?:<p>\s*)?---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?✨\s*Локация:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
-        return html.replace(re, '');
+        let result = html;
+        if (settings().trackSceneModule) {
+            const sceneRe = /(?:<p>\s*)?---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?✨\s*Локация:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
+            result = result.replace(sceneRe, '');
+        }
+        if (settings().trackCharacterModule) {
+            const charRe = /(?:<p>\s*)?---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?🧭\s*Где\s*мы:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
+            result = result.replace(charRe, '');
+        }
+        return result;
     }
 
-    function syncSceneToState(messageId, parsedScene) {
+    function syncBlocksToState(messageId, parsedScene, parsedChars) {
         const state = getState();
         if (!state) return;
-        if (!state.sceneByMessageIndex) state.sceneByMessageIndex = {};
-        state.sceneByMessageIndex[String(messageId)] = { ...parsedScene };
-        const keys = Object.keys(state.sceneByMessageIndex).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
-        for (const key of keys.slice(0, Math.max(0, keys.length - 500))) {
-            delete state.sceneByMessageIndex[String(key)];
+        
+        if (parsedScene) {
+            if (!state.sceneByMessageIndex) state.sceneByMessageIndex = {};
+            state.sceneByMessageIndex[String(messageId)] = { ...parsedScene };
         }
+        
+        if (parsedChars) {
+            if (!state.charactersByMessageIndex) state.charactersByMessageIndex = {};
+            state.charactersByMessageIndex[String(messageId)] = { ...parsedChars };
+        }
+        
         scheduleSilentSave();
     }
 
@@ -522,6 +662,7 @@ ${body}
             'УЧАСТНИКИ:'
         ];
         for (const e of entities) lines.push(`- ${e.name} (${e.type})${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`);
+        
         lines.push('', 'ТЕКУЩАЯ СЦЕНА:');
         if (settings().trackSceneModule) {
             if (state.scene?.time) lines.push(`- Дата и время: ${state.scene.time}`);
@@ -529,6 +670,7 @@ ${body}
             if (state.scene?.location) lines.push(`- Локация: ${state.scene.location}`);
             if (!state.scene?.time && !state.scene?.weather && !state.scene?.location) lines.push('- Пока не определена.');
         }
+        
         lines.push('', 'НАПРАВЛЕННЫЕ ОТНОШЕНИЯ:');
         for (const r of relations) {
             const a = state.entities[r.sourceId]?.name || r.sourceId;
@@ -702,7 +844,7 @@ ${body}
     }
 
     // ---------------------------------------------------------------------
-    // Footer / panel rendering
+    // Footer rendering
     // ---------------------------------------------------------------------
 
     function sceneFooterMarkup(scene) {
@@ -714,22 +856,59 @@ ${body}
         return `<div class="dr-scene-footer"><div class="dr-scene-title">✧ ТЕКУЩИЙ СЕТТИНГ ✧</div>${parts.join('')}</div>`;
     }
 
-    function refreshSceneFooters() {
-        const enabled = settings().trackSceneModule;
-        document.querySelectorAll('#chat .dr-scene-footer, #chat .dr-scene-placeholder').forEach(el => el.remove());
-        if (!enabled) return;
+    function characterFooterMarkup(charData) {
+        if (!settings().trackCharacterModule || !charData) return '';
+        let parts = [];
+        
+        if (charData.characters && charData.characters.length) {
+            for (const ch of charData.characters) {
+                parts.push(`
+                    <div class="dr-char">
+                        <div class="dr-char-name">${escapeHtml(ch.gender)} ${escapeHtml(ch.name)} ${ch.role ? `<span class="dr-char-role">(${escapeHtml(ch.role)})</span>` : ''}</div>
+                        ${ch.status ? `<div class="dr-char-row"><span class="dr-char-label">Статус:</span> ${escapeHtml(ch.status)}</div>` : ''}
+                        ${ch.clothes ? `<div class="dr-char-row"><span class="dr-char-label">Одежда:</span> ${escapeHtml(ch.clothes)}</div>` : ''}
+                    </div>
+                `);
+            }
+        }
+        
+        let posHtml = '';
+        if (charData.spatialPos) {
+            posHtml = `<div class="dr-char-pos"><span>🧭</span> <b>Где мы:</b> ${escapeHtml(charData.spatialPos)}</div>`;
+        }
+
+        if (!parts.length && !posHtml) return '';
+        
+        return `<div class="dr-char-footer">
+            <div class="dr-char-title">--- ✧ 🌸 ЗАМЕЧАН ПЕРСОНАЖ ✧ ---</div>
+            <div class="dr-char-list">${parts.join('')}</div>
+            ${posHtml}
+        </div>`;
+    }
+
+    function refreshFooters() {
+        document.querySelectorAll('#chat .dr-scene-footer, #chat .dr-char-footer, #chat .dr-scene-placeholder').forEach(el => el.remove());
         const ctx = getContext();
         document.querySelectorAll('#chat .mes[mesid]').forEach(mesEl => {
             const id = Number(mesEl.getAttribute('mesid'));
             if (!Number.isInteger(id) || id < 0) return;
             const mes = ctx?.chat?.[id];
             if (!mes || mes.is_user || mes.is_system) return;
-            const parsed = parseSceneBlock(messageText(mes));
-            if (!parsed) return;
+            
             const textEl = mesEl.querySelector('.mes_text');
             if (!textEl) return;
-            const html = sceneFooterMarkup(parsed);
-            if (html) textEl.insertAdjacentHTML('beforeend', html);
+
+            let htmlToAdd = '';
+            if (settings().trackSceneModule) {
+                const scene = parseSceneBlock(messageText(mes));
+                if (scene) htmlToAdd += sceneFooterMarkup(scene);
+            }
+            if (settings().trackCharacterModule) {
+                const chars = parseCharacterBlock(messageText(mes));
+                if (chars) htmlToAdd += characterFooterMarkup(chars);
+            }
+            
+            if (htmlToAdd) textEl.insertAdjacentHTML('beforeend', htmlToAdd);
         });
     }
 
@@ -739,22 +918,44 @@ ${body}
         try {
             formatter.addHook((html, hookContext) => {
                 if (hookContext?.isUser || hookContext?.isSystem || hookContext?.isReasoning) return html;
-                if (!settings().trackSceneModule) return html;
                 const messageId = Number(hookContext?.messageId);
                 if (!Number.isInteger(messageId) || messageId < 0) return html;
                 const ctx = getContext();
                 const mes = ctx?.chat?.[messageId];
                 if (!mes) return html;
-                const parsed = parseSceneBlock(messageText(mes));
-                if (!parsed) return html;
-                try { syncSceneToState(messageId, parsed); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
-                const stripped = stripSceneBlockFromHtml(html);
-                const footer = sceneFooterMarkup(parsed);
-                return stripped + footer;
+                
+                const text = messageText(mes);
+                let scene = null;
+                let chars = null;
+                let shouldProcess = false;
+
+                if (settings().trackSceneModule) {
+                    scene = parseSceneBlock(text);
+                    if (scene) shouldProcess = true;
+                }
+                if (settings().trackCharacterModule) {
+                    chars = parseCharacterBlock(text);
+                    if (chars) shouldProcess = true;
+                }
+                
+                if (!shouldProcess) return html;
+                
+                try { syncBlocksToState(messageId, scene, chars); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
+                
+                let stripped = stripBlocksFromHtml(html);
+                let footers = '';
+                if (scene) footers += sceneFooterMarkup(scene);
+                if (chars) footers += characterFooterMarkup(chars);
+                
+                return stripped + footers;
             }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
             registerMessageFormatter.done = true;
         } catch (err) { console.warn(`[${MODULE}] Message formatter registration failed`, err); }
     }
+
+    // ---------------------------------------------------------------------
+    // Panel rendering
+    // ---------------------------------------------------------------------
 
     function renderPanel() {
         const root = document.getElementById(ROOT_ID);
@@ -784,6 +985,7 @@ ${body}
 
         const configBox = document.createElement('section');
         configBox.className = 'dr-config';
+        
         const excludeLabel = document.createElement('label');
         excludeLabel.className = 'dr-setting';
         const excludeInput = document.createElement('input');
@@ -804,18 +1006,72 @@ ${body}
         sceneInput.type = 'checkbox';
         sceneInput.checked = settings().trackSceneModule !== false;
         const sceneText = document.createElement('span');
-        sceneText.textContent = 'Отслеживать сеттинг: дата, время, погода и локация';
+        sceneText.textContent = 'Отслеживать сеттинг (время, погода, локация)';
         sceneInput.addEventListener('change', async () => {
             settings().trackSceneModule = sceneInput.checked;
             const ctx = getContext();
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
-            else if (typeof window.saveSettingsDebounced === 'function') window.saveSettingsDebounced();
-            updateSceneInjection();
-            refreshSceneFooters();
+            updateSystemInjection();
+            refreshFooters();
             if (state.targetLorebook) await syncToSelectedLorebook(false);
-            toast(sceneInput.checked ? 'Отслеживание сеттинга включено.' : 'Отслеживание сеттинга отключено. Сохранённые данные не удалены.');
         });
         sceneLabel.append(sceneInput, sceneText);
+
+        const charLabel = document.createElement('label');
+        charLabel.className = 'dr-setting';
+        const charInput = document.createElement('input');
+        charInput.type = 'checkbox';
+        charInput.checked = settings().trackCharacterModule !== false;
+        const charText = document.createElement('span');
+        charText.textContent = 'Отслеживать персонажей (статус, одежда, позиции)';
+        charInput.addEventListener('change', async () => {
+            settings().trackCharacterModule = charInput.checked;
+            const ctx = getContext();
+            if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+            updateSystemInjection();
+            refreshFooters();
+            if (state.targetLorebook) await syncToSelectedLorebook(false);
+        });
+        charLabel.append(charInput, charText);
+
+        // Настройки вырезания истории
+        const stripLabel = document.createElement('label');
+        stripLabel.className = 'dr-setting';
+        const stripInput = document.createElement('input');
+        stripInput.type = 'checkbox';
+        stripInput.checked = settings().stripHistoryBlocks !== false;
+        const stripText = document.createElement('span');
+        stripText.textContent = 'Вырезать блоки из истории для ИИ (экономия контекста)';
+        stripLabel.append(stripInput, stripText);
+
+        const keepLabel = document.createElement('label');
+        keepLabel.className = 'dr-setting';
+        keepLabel.style.paddingLeft = '1.5rem';
+        const keepText = document.createElement('span');
+        keepText.textContent = 'Оставлять в последних сообщениях:';
+        const keepSelect = document.createElement('select');
+        keepSelect.className = 'dr-lorebook-select';
+        keepSelect.style.width = 'auto';
+        keepSelect.style.padding = '0.2rem';
+        [0, 1, 2, 3, 4].forEach(n => {
+            const opt = document.createElement('option');
+            opt.value = n;
+            opt.textContent = n === 0 ? 'Ни в одном (вырезать всё)' : `${n}`;
+            keepSelect.append(opt);
+        });
+        keepSelect.value = String(settings().keepLastBlocks ?? 2);
+        
+        const updateStripSettings = () => {
+            settings().stripHistoryBlocks = stripInput.checked;
+            settings().keepLastBlocks = Number(keepSelect.value);
+            keepSelect.disabled = !stripInput.checked;
+            const ctx = getContext();
+            if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
+        };
+        stripInput.addEventListener('change', updateStripSettings);
+        keepSelect.addEventListener('change', updateStripSettings);
+        keepSelect.disabled = !stripInput.checked;
+        keepLabel.append(keepText, keepSelect);
 
         const loreLabel = document.createElement('label');
         loreLabel.className = 'dr-setting dr-lorebook-setting';
@@ -837,10 +1093,8 @@ ${body}
             await saveState();
             if (state.targetLorebook) await syncToSelectedLorebook(true);
         });
-        const loreHint = document.createElement('p');
-        loreHint.className = 'dr-muted';
-        loreHint.textContent = 'Выбранная книга получает отдельную управляемую запись. Она обновляется после анализа; остальные записи книги сохраняются.';
-        configBox.append(excludeLabel, sceneLabel, loreLabel, refreshBooks, loreHint);
+        
+        configBox.append(excludeLabel, sceneLabel, charLabel, stripLabel, keepLabel, loreLabel, refreshBooks);
         content.append(configBox);
         populateLorebookSelect(loreSelect, state.targetLorebook);
 
@@ -851,13 +1105,9 @@ ${body}
         info.className = 'dr-muted';
         info.textContent = `${visibleEntityCount} участников · ${visibleRelationCount} направленных связей · ${state.journal.length} записей журнала`;
         content.append(info);
+        
         const rels = Object.values(state.relationships).filter(r => !ignoredMain || (norm(state.entities[r.sourceId]?.name) !== ignoredMain && norm(state.entities[r.targetId]?.name) !== ignoredMain)).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-        if (!rels.length) {
-            const empty = document.createElement('p');
-            empty.className = 'dr-muted';
-            empty.textContent = 'Пока нет отношений. После ответа ИИ будет выполнен фоновый анализ.';
-            content.append(empty);
-        }
+        
         for (const r of rels.slice(0, 50)) {
             const card = document.createElement('section');
             card.className = 'dr-relation';
@@ -883,33 +1133,6 @@ ${body}
             content.append(card);
         }
 
-        const entityBox = document.createElement('details');
-        entityBox.className = 'dr-entities';
-        const summary = document.createElement('summary');
-        summary.textContent = `Реестр участников (${Object.keys(state.entities).length})`;
-        entityBox.append(summary);
-        for (const e of Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).sort((a, b) => a.name.localeCompare(b.name))) {
-            const p = document.createElement('p');
-            p.textContent = `${e.name} — ${e.type}${e.aliases?.length ? `; псевдонимы: ${e.aliases.join(', ')}` : ''}`;
-            entityBox.append(p);
-        }
-        content.append(entityBox);
-
-        const journalBox = document.createElement('details');
-        journalBox.className = 'dr-journal';
-        const journalSummary = document.createElement('summary');
-        journalSummary.textContent = `Последние события (${state.journal.length})`;
-        journalBox.append(journalSummary);
-        for (const entry of state.journal.slice(-15).reverse()) {
-            const p = document.createElement('p');
-            const a = state.entities[entry.sourceId]?.name || entry.sourceId;
-            const b = state.entities[entry.targetId]?.name || entry.targetId;
-            const changes = Object.entries(entry.deltas || {}).map(([k, v]) => `${LABELS[k] || k} ${v > 0 ? '+' : ''}${v}`).join(', ');
-            const statusNote = entry.statusDescription ? ` Статус: ${entry.statusDescription}.` : '';
-            p.textContent = `${a} → ${b}: ${changes || 'обновление описания отношений'}.${statusNote} ${entry.reason}`;
-            journalBox.append(p);
-        }
-        content.append(journalBox);
         root.querySelector('.dr-count').textContent = `${Object.keys(state.entities).length} участников`;
     }
 
@@ -958,7 +1181,7 @@ ${body}
         a.download = 'Dynamic-Relationships-Lorebook.json';
         a.click();
         URL.revokeObjectURL(url);
-        toast('Сформирован JSON-файл управляемой записи. Импортируйте его в World Info.');
+        toast('Сформирован JSON-файл управляемой записи.');
     }
 
     function registerMacro() {
@@ -966,7 +1189,7 @@ ${body}
         if (ctx?.macros?.register && !registered) {
             try {
                 ctx.macros.register(MACRO_NAME, {
-                    description: 'Вставляет актуальное состояние отношений из Dynamic Relationships',
+                    description: 'Вставляет актуальное состояние отношений',
                     handler: () => {
                         const state = getState();
                         return state ? renderLorebookText(state) : '[Dynamic Relationships: чат не загружен]';
@@ -1004,23 +1227,37 @@ ${body}
         const ctx = getContext();
         if (!ctx?.eventSource || !ctx?.event_types) return;
         const es = ctx.eventSource, ev = ctx.event_types;
-        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); updateSceneInjection(); renderPanel(); });
-        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, () => { updateSceneInjection(); });
-        if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, () => { updateSceneInjection(); scheduleAnalyze(); });
+        
+        if (ev.APP_READY) es.on(ev.APP_READY, () => { mountPanel(); registerMacro(); registerMessageFormatter(); updateSystemInjection(); renderPanel(); });
+        if (ev.CHARACTER_MESSAGE_RENDERED) es.on(ev.CHARACTER_MESSAGE_RENDERED, () => { updateSystemInjection(); });
+        if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, () => { updateSystemInjection(); scheduleAnalyze(); });
         if (ev.CHAT_CHANGED) es.on(ev.CHAT_CHANGED, () => {
             busy = false;
+            restoreHistoryAfterGeneration(); // Восстанавливаем при смене чата на всякий случай
             registerMacro();
-            updateSceneInjection();
+            updateSystemInjection();
             renderPanel();
         });
+        
         for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_UPDATED']) {
             if (ev[name]) es.on(ev[name], () => {
                 const state = getState();
                 if (state) state.reconciliationNeeded = true;
-                updateSceneInjection();
+                updateSystemInjection();
                 scheduleSilentSave();
             });
         }
+
+        // Перехват генерации для вырезания блоков из истории
+        if (ev.GENERATION_STARTED) es.on(ev.GENERATION_STARTED, () => {
+            stripHistoryForGeneration();
+        });
+        if (ev.GENERATION_ENDED) es.on(ev.GENERATION_ENDED, () => {
+            restoreHistoryAfterGeneration();
+        });
+        if (ev.GENERATION_STOPPED) es.on(ev.GENERATION_STOPPED, () => {
+            restoreHistoryAfterGeneration();
+        });
     }
 
     function init() {
@@ -1034,8 +1271,8 @@ ${body}
         registerMacro();
         registerMessageFormatter();
         bindEvents();
-        updateSceneInjection();
-        log(`Loaded v${VERSION}. Scene module uses prompt injection + message parsing.`);
+        updateSystemInjection();
+        log(`Loaded v${VERSION}. Context stripper enabled.`);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
