@@ -1,6 +1,6 @@
-/* Dynamic Relationships 0.7.0
+/* Dynamic Relationships 0.7.1
  * Chat-scoped relationship database + generated lorebook projection
- * + scene & character tracking with context history stripping.
+ * + scene & character tracking + context history stripping.
  */
 (() => {
     'use strict';
@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.7.0';
+    const VERSION = '0.7.1';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -28,8 +28,8 @@
         syncLorebookProjection: true,
         trackSceneModule: true,
         trackCharacterModule: true,
-        stripHistoryBlocks: true, // Новая опция
-        keepLastBlocks: 2,        // Новая опция
+        stripHistoryBlocks: true,
+        keepLastBlocks: 2,
         includeNeutralRelations: false,
         debug: false
     };
@@ -51,7 +51,7 @@
     let refreshQueued = false;
     let lorebookListCache = null;
     let silentSaveTimer = null;
-    let savedChatMessages = null; // Для временного сохранения оригинальных сообщений
+    let savedChatMessages = null;
 
     const log = (...args) => console[settings()?.debug ? 'debug' : 'log'](`[${MODULE}]`, ...args);
     const getContext = () => window.SillyTavern?.getContext?.();
@@ -298,22 +298,38 @@
         
         const content = blockMatch[1];
         const characters = [];
-        const charRegex = /(♂️|♀️|⚧️)\s*([^\n(]+)(?:\s*\(([^)]+)\))?\s*\n?\s*Статус:\s*([^\n]*)\n?\s*Одежда:\s*([^\n]*)/giu;
         
-        let match;
-        while ((match = charRegex.exec(content)) !== null) {
-            characters.push({
-                gender: match[1],
-                name: cleanName(match[2]),
-                role: cleanName(match[3] || ''),
-                status: cleanName(match[4] || '—'),
-                clothes: cleanName(match[5] || '—')
-            });
+        // Функция для очистки, сохраняющая переносы строк
+        const multiLineClean = (v) => {
+            return String(v ?? '').split('\n').map(l => l.trim()).filter(Boolean).join('\n').slice(0, 600);
+        };
+
+        // Разделяем блок на части по иконкам пола
+        const charBlocks = content.split(/(?=(?:♂️|♀️|⚧️))/u);
+        
+        for (const block of charBlocks) {
+            const genderMatch = block.match(/^(♂️|♀️|⚧️)/u);
+            if (!genderMatch) continue;
+            const gender = genderMatch[1];
+            
+            const nameMatch = block.match(/(?:♂️|♀️|⚧️)\s*([^\n(]+)(?:\s*\(([^)]+)\))?/u);
+            const name = nameMatch ? cleanName(nameMatch[1]) : '';
+            const role = nameMatch && nameMatch[2] ? cleanName(nameMatch[2]) : '';
+            
+            const statusMatch = block.match(/Статус:\s*([\s\S]*?)(?=\n\s*Одежда:|$)/iu);
+            const status = statusMatch ? multiLineClean(statusMatch[1]) : '—';
+            
+            const clothesMatch = block.match(/Одежда:\s*([\s\S]*?)(?=\n\s*🧭|$)/iu);
+            const clothes = clothesMatch ? multiLineClean(clothesMatch[1]) : '—';
+            
+            if (name) {
+                characters.push({ gender, name, role, status, clothes });
+            }
         }
-
-        const posMatch = content.match(/🧭\s*Где\s*мы:\s*([^\n]+)/iu);
-        const spatialPos = posMatch ? cleanName(posMatch[1]) : '';
-
+        
+        const posMatch = content.match(/🧭\s*Где\s*мы:\s*([\s\S]+)/iu);
+        const spatialPos = posMatch ? multiLineClean(posMatch[1]) : '';
+        
         if (!characters.length && !spatialPos) return null;
         return { characters, spatialPos };
     }
@@ -470,11 +486,11 @@ ${state.excludeMainCharacter ? `- ВАЖНО: Пропусти персонаж�
         if (!html) return html;
         let result = html;
         if (settings().trackSceneModule) {
-            const sceneRe = /(?:<p>\s*)?---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?✨\s*Локация:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
+            const sceneRe = /(?:<p>\s*)?---\s*✧\s*ТЕКУЩИЙ\s*СЕТТИНГ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
             result = result.replace(sceneRe, '');
         }
         if (settings().trackCharacterModule) {
-            const charRe = /(?:<p>\s*)?---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?🧭\s*Где\s*мы:[^<\n]*(?:<br\s*\/?>)?(?:\s*<\/p>)?/iu;
+            const charRe = /(?:<p>\s*)?---\s*✧\s*🌸\s*ЗАМЕЧАН\s*ПЕРСОНАЖ\s*✧\s*---[\s\S]*?(?=(?:<p>\s*)?---\s*✧|<\/body>|$)/iu;
             result = result.replace(charRe, '');
         }
         return result;
@@ -865,8 +881,8 @@ ${body}
                 parts.push(`
                     <div class="dr-char">
                         <div class="dr-char-name">${escapeHtml(ch.gender)} ${escapeHtml(ch.name)} ${ch.role ? `<span class="dr-char-role">(${escapeHtml(ch.role)})</span>` : ''}</div>
-                        ${ch.status ? `<div class="dr-char-row"><span class="dr-char-label">Статус:</span> ${escapeHtml(ch.status)}</div>` : ''}
-                        ${ch.clothes ? `<div class="dr-char-row"><span class="dr-char-label">Одежда:</span> ${escapeHtml(ch.clothes)}</div>` : ''}
+                        ${ch.status ? `<div class="dr-char-row"><span class="dr-char-label">Статус:</span><span class="dr-char-val">${escapeHtml(ch.status)}</span></div>` : ''}
+                        ${ch.clothes ? `<div class="dr-char-row"><span class="dr-char-label">Одежда:</span><span class="dr-char-val">${escapeHtml(ch.clothes)}</span></div>` : ''}
                     </div>
                 `);
             }
@@ -874,7 +890,7 @@ ${body}
         
         let posHtml = '';
         if (charData.spatialPos) {
-            posHtml = `<div class="dr-char-pos"><span>🧭</span> <b>Где мы:</b> ${escapeHtml(charData.spatialPos)}</div>`;
+            posHtml = `<div class="dr-char-pos"><span>🧭</span> <b>Где мы:</b> <span class="dr-char-val">${escapeHtml(charData.spatialPos)}</span></div>`;
         }
 
         if (!parts.length && !posHtml) return '';
@@ -1233,7 +1249,7 @@ ${body}
         if (ev.MESSAGE_RECEIVED) es.on(ev.MESSAGE_RECEIVED, () => { updateSystemInjection(); scheduleAnalyze(); });
         if (ev.CHAT_CHANGED) es.on(ev.CHAT_CHANGED, () => {
             busy = false;
-            restoreHistoryAfterGeneration(); // Восстанавливаем при смене чата на всякий случай
+            restoreHistoryAfterGeneration();
             registerMacro();
             updateSystemInjection();
             renderPanel();
@@ -1248,7 +1264,6 @@ ${body}
             });
         }
 
-        // Перехват генерации для вырезания блоков из истории
         if (ev.GENERATION_STARTED) es.on(ev.GENERATION_STARTED, () => {
             stripHistoryForGeneration();
         });
