@@ -1,4 +1,4 @@
-/* Dynamic Relationships 0.8.2
+/* Dynamic Relationships 0.8.3
  * Chat-scoped relationship database + generated lorebook projection
  * + scene, character & thought tracking + context history stripping.
  */
@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.8.2';
+    const VERSION = '0.8.3';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -80,6 +80,7 @@
             lorebookProjection: { title: 'Dynamic Relationships — managed projection', content: '', updatedAt: null },
             excludeMainCharacter: false,
             targetLorebook: '',
+            storageMode: 'internal',
             lorebookEntryUid: null,
             scene: { time: '', weather: '', location: '', updatedAt: null },
             sceneByMessageIndex: {},
@@ -99,6 +100,8 @@
         state.lorebookProjection ??= { title: 'Dynamic Relationships — managed projection', content: '', updatedAt: null };
         state.excludeMainCharacter ??= false;
         state.targetLorebook ??= '';
+        if (!state.storageMode) state.storageMode = state.targetLorebook ? 'both' : 'internal';
+        if (!['internal', 'both'].includes(state.storageMode)) state.storageMode = 'internal';
         state.lorebookEntryUid ??= null;
         state.scene ??= { time: '', weather: '', location: '', updatedAt: null };
         state.sceneByMessageIndex ??= {};
@@ -167,6 +170,7 @@
         rebuildLorebookProjection(state);
         if (typeof ctx.saveMetadata === 'function') await ctx.saveMetadata();
         updateSystemInjection();
+        if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
     }
 
     function scheduleSilentSave() {
@@ -777,38 +781,38 @@ ${body}
         state.lorebookProjection.updatedAt = new Date().toISOString();
     }
 
-    // Исправление: добавление CSRF-заголовков для работы World Info API
-    async function worldInfoRequest(endpoint, body = null) {
+    // SillyTavern World Info endpoints use POST, including /list.
+    async function worldInfoRequest(endpoint, body = {}) {
         const headers = { 'Content-Type': 'application/json' };
-        
-        // Получаем CSRF токен
         if (typeof window.getRequestHeaders === 'function') {
             Object.assign(headers, window.getRequestHeaders());
         } else {
             const ctx = getContext();
-            if (ctx?.getRequestHeaders) Object.assign(headers, ctx.getRequestHeaders());
-        }
-        
-        const options = {
-            method: body ? 'POST' : 'GET',
-            headers: headers,
-            credentials: 'include'
-        };
-        
-        if (body) {
-            options.body = JSON.stringify(body);
+            if (typeof ctx?.getRequestHeaders === 'function') Object.assign(headers, ctx.getRequestHeaders());
         }
 
-        const response = await fetch(`/api/worldinfo/${endpoint}`, options);
-        if (!response.ok) throw new Error(`World Info API ${endpoint}: HTTP ${response.status}`);
-        return response.status === 204 ? null : response.json();
+        const response = await fetch(`/api/worldinfo/${endpoint}`, {
+            method: 'POST',
+            headers,
+            credentials: 'same-origin',
+            body: JSON.stringify(body ?? {})
+        });
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error(`World Info API ${endpoint}: HTTP ${response.status}${detail ? ` — ${detail.slice(0, 240)}` : ''}`);
+        }
+        if (response.status === 204) return null;
+        const text = await response.text();
+        if (!text) return null;
+        try { return JSON.parse(text); }
+        catch { throw new Error(`World Info API ${endpoint}: сервер вернул некорректный JSON`); }
     }
 
     async function loadLorebookList(force = false) {
         if (lorebookListCache && !force) return lorebookListCache;
         try {
-            const response = await worldInfoRequest('list'); // GET запрос без тела
-            const books = Array.isArray(response) ? response : (response?.data || []);
+            const response = await worldInfoRequest('list', {});
+            const books = Array.isArray(response) ? response : (response?.data || response?.worlds || []);
             lorebookListCache = books;
             return lorebookListCache;
         } catch (err) {
@@ -832,7 +836,11 @@ ${body}
 
     async function syncToSelectedLorebook(showToast = true) {
         const state = getState();
-        if (!state?.targetLorebook) {
+        if (!state || state.storageMode !== 'both') {
+            if (showToast) toast('Выберите режим «Внутренняя база + Lorebook», чтобы включить синхронизацию.', 'warning');
+            return false;
+        }
+        if (!state.targetLorebook) {
             if (showToast) toast('Сначала выберите Lorebook для сохранения.', 'warning');
             return false;
         }
@@ -905,7 +913,7 @@ ${body}
             state.processedExchanges.push(sig);
             state.processedExchanges = state.processedExchanges.slice(-3000);
             await saveState();
-            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
             log(`Exchange analyzed; ${applied.length} directed relationship change(s).`);
         } catch (err) {
             console.error(`[${MODULE}] Analysis failed:`, err);
@@ -932,20 +940,26 @@ ${body}
         select.replaceChildren();
         const placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = 'Только внутреннее хранилище чата';
+        placeholder.textContent = 'Выберите Lorebook…';
         select.append(placeholder);
         
         for (const book of books) {
             const option = document.createElement('option');
-            option.value = book.file_id || book.name;
+            option.value = book.file_id || book.name; // API expects the filename id, not the display label.
             option.textContent = book.name || book.file_id;
             select.append(option);
         }
         
-        select.value = books.some(b => (b.file_id || b.name) === current) ? current : '';
-        if (current && !select.value) {
+        const matched = books.find(b => (b.file_id || b.name) === current || b.name === current);
+        select.value = matched ? (matched.file_id || matched.name) : '';
+        if (matched && current !== select.value) {
+            const state = getState();
+            if (state) { state.targetLorebook = select.value; await saveState(false); }
+        }
+        if (current && !matched) {
             const state = getState();
             if (state) { state.targetLorebook = ''; await saveState(false); }
+            toast('Ранее выбранный Lorebook не найден. Выберите книгу заново.', 'warning');
         }
     }
 
@@ -1114,6 +1128,7 @@ ${body}
         const syncBtn = document.createElement('button');
         syncBtn.textContent = 'Сохранить в Lorebook';
         syncBtn.addEventListener('click', () => syncToSelectedLorebook(true));
+        syncBtn.disabled = state.storageMode !== 'both' || !state.targetLorebook;
         toolbar.append(exportBtn, undoBtn, analyzeBtn, syncBtn);
         content.append(toolbar);
 
@@ -1128,7 +1143,7 @@ ${body}
         excludeInput.addEventListener('change', async () => {
             state.excludeMainCharacter = excludeInput.checked;
             await saveState(false);
-            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
         });
         const excludeText = document.createElement('span');
         excludeText.textContent = 'Не отслеживать {{char}} (нейтральный рассказчик)';
@@ -1147,7 +1162,7 @@ ${body}
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
             updateSystemInjection();
             refreshFooters();
-            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
         });
         sceneLabel.append(sceneInput, sceneText);
 
@@ -1164,7 +1179,7 @@ ${body}
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
             updateSystemInjection();
             refreshFooters();
-            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
         });
         charLabel.append(charInput, charText);
 
@@ -1181,7 +1196,7 @@ ${body}
             if (typeof ctx?.saveSettingsDebounced === 'function') ctx.saveSettingsDebounced();
             updateSystemInjection();
             refreshFooters();
-            if (state.targetLorebook) await syncToSelectedLorebook(false);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
         });
         thoughtLabel.append(thoughtInput, thoughtText);
 
@@ -1223,6 +1238,27 @@ ${body}
         keepSelect.disabled = !stripInput.checked;
         keepLabel.append(keepText, keepSelect);
 
+        const storageLabel = document.createElement('label');
+        storageLabel.className = 'dr-setting dr-lorebook-setting';
+        const storageText = document.createElement('span');
+        storageText.textContent = 'Куда сохранять данные';
+        const storageSelect = document.createElement('select');
+        storageSelect.className = 'dr-lorebook-select';
+        [
+            { value: 'internal', label: 'Только внутренняя база чата' },
+            { value: 'both', label: 'Внутренняя база + Lorebook' }
+        ].forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.value;
+            option.textContent = item.label;
+            storageSelect.append(option);
+        });
+        storageSelect.value = state.storageMode || 'internal';
+        storageLabel.append(storageText, storageSelect);
+        const storageNote = document.createElement('p');
+        storageNote.className = 'dr-muted';
+        storageNote.textContent = 'Внутренняя база хранит полное состояние чата. При выборе второго режима расширение дополнительно синхронизирует управляемую запись в выбранный Lorebook.';
+
         const loreLabel = document.createElement('label');
         loreLabel.className = 'dr-setting dr-lorebook-setting';
         const loreText = document.createElement('span');
@@ -1231,27 +1267,45 @@ ${body}
         loreSelect.className = 'dr-lorebook-select';
         const placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = 'Только внутреннее хранилище чата';
+        placeholder.textContent = 'Выберите Lorebook…';
         loreSelect.append(placeholder);
         loreLabel.append(loreText, loreSelect);
         const refreshBooks = document.createElement('button');
         refreshBooks.textContent = 'Обновить список';
-        refreshBooks.addEventListener('click', async () => { 
-            await loadLorebookList(true); 
-            await populateLorebookSelect(loreSelect, state.targetLorebook); 
+        refreshBooks.addEventListener('click', async () => {
+            await loadLorebookList(true);
+            await populateLorebookSelect(loreSelect, state.targetLorebook);
             if (!lorebookListCache?.length) toast('Lorebook не найдены. Создайте книгу в World Info.', 'info');
         });
-        
+
+        const updateStorageControls = () => {
+            const useLorebook = state.storageMode === 'both';
+            loreSelect.disabled = !useLorebook;
+            refreshBooks.disabled = !useLorebook;
+            syncBtn.disabled = !useLorebook || !state.targetLorebook;
+        };
+        storageSelect.addEventListener('change', async () => {
+            state.storageMode = storageSelect.value;
+            await saveState(false);
+            updateStorageControls();
+            if (state.storageMode === 'both' && state.targetLorebook) {
+                await syncToSelectedLorebook(true);
+            } else {
+                toast('Сохранение продолжается во внутренней базе чата.');
+            }
+        });
+
         loreSelect.addEventListener('change', async () => {
             state.targetLorebook = loreSelect.value;
             state.lorebookEntryUid = null;
             await saveState(false);
-            if (state.targetLorebook) await syncToSelectedLorebook(true);
+            if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(true);
+            updateStorageControls();
         });
-        
-        configBox.append(excludeLabel, sceneLabel, charLabel, thoughtLabel, stripLabel, keepLabel, loreLabel, refreshBooks);
+
+        configBox.append(excludeLabel, sceneLabel, charLabel, thoughtLabel, stripLabel, keepLabel, storageLabel, storageNote, loreLabel, refreshBooks);
         content.append(configBox);
-        populateLorebookSelect(loreSelect, state.targetLorebook);
+        populateLorebookSelect(loreSelect, state.targetLorebook).then(updateStorageControls);
 
         const ignoredMain = state.excludeMainCharacter ? norm(getActiveNames().mainName) : '';
         const visibleEntityCount = Object.values(state.entities).filter(e => !ignoredMain || norm(e.name) !== ignoredMain).length;
@@ -1347,7 +1401,7 @@ ${body}
             relation.updatedAt = new Date().toISOString();
         }
         await saveState();
-        if (state.targetLorebook) await syncToSelectedLorebook(false);
+        if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
         toast('Последнее изменение отношений отменено.');
     }
 
@@ -1468,7 +1522,7 @@ ${body}
         registerMessageFormatter();
         bindEvents();
         updateSystemInjection();
-        log(`Loaded v${VERSION}. Lorebook API fixed. Thoughts renamed.`);
+        log(`Loaded v${VERSION}. World Info list POST + storage mode enabled.`);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
