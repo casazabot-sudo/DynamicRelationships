@@ -10,7 +10,7 @@
     const LEGACY_KEY = 'dynamic_relationships_v1';
     const ROOT_ID = 'dynamic-relationships-extension';
     const MACRO_NAME = 'dr_relationships';
-    const VERSION = '0.8.4';
+    const VERSION = '0.8.3';
     const METRICS = ['trust', 'affection', 'respect', 'attachment', 'attraction', 'fear', 'jealousy', 'irritation', 'admiration'];
     const LABELS = {
         trust: 'Доверие', affection: 'Симпатия', respect: 'Уважение',
@@ -56,8 +56,6 @@
     let lorebookListCache = null;
     let silentSaveTimer = null;
     let savedChatMessages = null;
-    let panelActionStatus = { text: '', type: 'info' };
-    const activeActions = new Set();
 
     const log = (...args) => console[settings()?.debug ? 'debug' : 'log'](`[${MODULE}]`, ...args);
     const getContext = () => window.SillyTavern?.getContext?.();
@@ -812,15 +810,16 @@ ${body}
 
     async function loadLorebookList(force = false) {
         if (lorebookListCache && !force) return lorebookListCache;
-        const response = await worldInfoRequest('list', {});
-        // SillyTavern 1.19.0 returns an array of { file_id, name, extensions }.
-        const books = Array.isArray(response) ? response
-            : Array.isArray(response?.data) ? response.data
-            : Array.isArray(response?.worlds) ? response.worlds
-            : null;
-        if (!books) throw new Error('Неожиданный формат ответа списка World Info.');
-        lorebookListCache = books.filter(book => book && (book.file_id || book.name));
-        return lorebookListCache;
+        try {
+            const response = await worldInfoRequest('list', {});
+            const books = Array.isArray(response) ? response : (response?.data || response?.worlds || []);
+            lorebookListCache = books;
+            return lorebookListCache;
+        } catch (err) {
+            console.warn(`[${MODULE}] Cannot load World Info list`, err);
+            toast(`Не удалось загрузить список Lorebook: ${err.message}`, 'warning');
+            return [];
+        }
     }
 
     function chatStableId() {
@@ -846,13 +845,9 @@ ${body}
             return false;
         }
         try {
-            const targetName = String(state.targetLorebook || '').trim();
-            if (!targetName) throw new Error('Не выбрана книга World Info.');
             rebuildLorebookProjection(state);
-            const book = await worldInfoRequest('get', { name: targetName });
-            if (!book || typeof book !== 'object') throw new Error('World Info /get вернул пустой ответ.');
+            const book = await worldInfoRequest('get', { name: state.targetLorebook });
             book.entries ??= {};
-            if (typeof book.entries !== 'object' || Array.isArray(book.entries)) throw new Error('У выбранного Lorebook некорректная структура entries.');
             const marker = managedEntryKey();
             let uid = null;
             let existing = null;
@@ -864,28 +859,28 @@ ${body}
             }
             const old = existing || {};
             book.entries[uid] = {
-                ...old, uid,
-                key: ['Dynamic Relationships'], keysecondary: [],
+                ...old,
+                uid,
+                key: ['Dynamic Relationships'],
+                keysecondary: [],
                 comment: `Dynamic Relationships — ${chatStableId()}`,
                 content: state.lorebookProjection.content,
-                constant: true, selective: false,
-                order: Number(old.order ?? 100), position: Number(old.position ?? 1),
-                disable: false, addMemo: true,
-                extensions: { ...(old.extensions || {}), dynamic_relationships: { managedKey: marker, chatId: chatStableId(), version: VERSION } }
+                constant: true,
+                selective: false,
+                order: Number(old.order ?? 100),
+                position: Number(old.position ?? 1),
+                disable: false,
+                addMemo: true,
+                extensions: {
+                    ...(old.extensions || {}),
+                    dynamic_relationships: { managedKey: marker, chatId: chatStableId(), version: VERSION }
+                }
             };
-            const editResult = await worldInfoRequest('edit', { name: targetName, data: book });
-            if (editResult?.ok === false) throw new Error('World Info API не подтвердил запись изменений.');
-
-            // Verify persisted data by reading the lorebook back from the server.
-            const verifyBook = await worldInfoRequest('get', { name: targetName });
-            const verifyEntry = Object.values(verifyBook?.entries || {}).find(entry => entry?.extensions?.dynamic_relationships?.managedKey === marker);
-            if (!verifyEntry) throw new Error('Запрос завершился, но управляемая запись не найдена при повторном чтении Lorebook.');
-            if (verifyEntry.content !== state.lorebookProjection.content) throw new Error('Запись найдена, но её содержимое не совпадает после сохранения.');
-
+            await worldInfoRequest('edit', { name: state.targetLorebook, data: book });
             state.lorebookEntryUid = uid;
             state.lastLorebookSyncAt = new Date().toISOString();
             await saveState(false);
-            if (showToast) toast(`Успешно сохранено и проверено в Lorebook «${targetName}» (UID ${uid}).`, 'success');
+            if (showToast) toast(`Отношения сохранены в Lorebook «${state.targetLorebook}».`);
             return true;
         } catch (err) {
             console.error(`[${MODULE}] Lorebook sync failed`, err);
@@ -894,21 +889,18 @@ ${body}
         }
     }
 
-    async function analyzeLatestExchange(force = false) {
+    async function analyzeLatestExchange() {
         const cfg = settings();
-        if (!cfg.enabled) { if (force) toast('Расширение отключено. Включи его перед анализом.', 'warning'); return false; }
-        if (!force && !cfg.analyzeAutomatically) return false;
-        if (busy) { if (force) toast('Анализ уже выполняется. Дождись его завершения.', 'info'); return false; }
+        if (!cfg.enabled || !cfg.analyzeAutomatically || busy) return;
         const ctx = getContext();
-        if (!ctx?.chat?.length || typeof ctx.generateRaw !== 'function') { if (force) toast('Контекст чата или generateRaw недоступен.', 'warning'); return false; }
+        if (!ctx?.chat?.length || typeof ctx.generateRaw !== 'function') return;
         const transcript = getTranscript();
-        if (transcript.length < 2) { if (force) toast('Недостаточно сообщений для анализа.', 'warning'); return false; }
+        if (transcript.length < 2) return;
         const assistantMessage = [...transcript].reverse().find(m => m.role === 'character');
-        if (!assistantMessage) { if (force) toast('В истории не найден ответ персонажа для анализа.', 'warning'); return false; }
+        if (!assistantMessage) return;
         const sig = exchangeSignature(transcript);
         const state = getState();
-        if (!state) return false;
-        if (state.processedExchanges.includes(sig)) { if (force) toast('Последний обмен уже проанализирован. Новых данных нет.', 'info'); return false; }
+        if (!state || state.processedExchanges.includes(sig)) return;
 
         busy = true;
         try {
@@ -923,67 +915,18 @@ ${body}
             await saveState();
             if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(false);
             log(`Exchange analyzed; ${applied.length} directed relationship change(s).`);
-            if (force) toast(`Анализ завершён. Обновлено направленных связей: ${applied.length}.`, 'success');
-            return true;
         } catch (err) {
             console.error(`[${MODULE}] Analysis failed:`, err);
             toast(`Dynamic Relationships: ошибка анализа — ${err.message}`, 'warning');
-            return false;
         } finally {
             busy = false;
         }
     }
 
     function toast(message, type = 'info') {
-        const toastrApi = window.toastr || getContext()?.toastr;
-        if (typeof toastrApi?.[type] === 'function') toastrApi[type](message);
-        else if (typeof toastrApi?.[type === 'warning' ? 'error' : type] === 'function') toastrApi[type === 'warning' ? 'error' : type](message);
-        else console[type === 'warning' ? 'warn' : 'info'](`[${MODULE}] ${message}`);
-        setPanelStatus(message, type);
-    }
-
-    function setPanelStatus(message, type = 'info') {
-        panelActionStatus = { text: String(message || ''), type };
-        const status = document.querySelector(`#${ROOT_ID} .dr-action-status`);
-        if (!status) return;
-        status.textContent = panelActionStatus.text;
-        status.dataset.type = type;
-        status.hidden = !panelActionStatus.text;
-    }
-
-    async function runButtonAction(button, busyLabel, action, successLabel) {
-        if (!button || activeActions.has(button)) return false;
-        const original = button.dataset.originalLabel || button.textContent;
-        button.dataset.originalLabel = original;
-        activeActions.add(button);
-        button.disabled = true;
-        button.classList.add('dr-action-running');
-        button.setAttribute('aria-busy', 'true');
-        button.textContent = busyLabel;
-        setPanelStatus(`${original}: выполняется…`, 'info');
-        try {
-            const result = await action();
-            if (result === false) {
-                if (!panelActionStatus.text || panelActionStatus.text.endsWith('выполняется…')) {
-                    setPanelStatus(`${original}: операция не выполнена. Проверь настройки и консоль.`, 'warning');
-                }
-            } else {
-                setPanelStatus(successLabel || `${original}: готово.`, 'success');
-            }
-            return result;
-        } catch (err) {
-            console.error(`[${MODULE}] ${original} failed`, err);
-            toast(`${original}: ${err.message || err}`, 'warning');
-            return false;
-        } finally {
-            activeActions.delete(button);
-            button.classList.remove('dr-action-running');
-            button.removeAttribute('aria-busy');
-            button.textContent = original;
-            if (button.isConnected) button.disabled = false;
-            const state = getState();
-            if (button.matches('.dr-sync-button')) button.disabled = false;
-        }
+        const ctx = getContext();
+        if (typeof ctx?.toastr?.[type] === 'function') ctx.toastr[type](message);
+        else console.info(`[${MODULE}] ${message}`);
     }
 
     function escapeHtml(value) {
@@ -991,44 +934,32 @@ ${body}
     }
 
     async function populateLorebookSelect(select, selectedName = '') {
-        if (!select) return [];
-        try {
-            const books = await loadLorebookList(false);
-            const current = selectedName || select.value;
-            select.replaceChildren();
-            const placeholder = document.createElement('option');
-            placeholder.value = '';
-            placeholder.textContent = 'Выберите Lorebook…';
-            select.append(placeholder);
-
-            for (const book of books) {
-                const option = document.createElement('option');
-                option.value = book.file_id || book.name; // API expects the filename id, not the display label.
-                option.textContent = book.name || book.file_id;
-                select.append(option);
-            }
-
-            const matched = books.find(b => (b.file_id || b.name) === current || b.name === current);
-            select.value = matched ? (matched.file_id || matched.name) : '';
-            if (matched && current !== select.value) {
-                const state = getState();
-                if (state) { state.targetLorebook = select.value; await saveState(false); }
-            }
-            if (current && !matched) {
-                const state = getState();
-                if (state) { state.targetLorebook = ''; await saveState(false); }
-                setPanelStatus('Ранее выбранный Lorebook не найден. Выбери книгу заново.', 'warning');
-            }
-            return books;
-        } catch (err) {
-            console.error(`[${MODULE}] Cannot populate Lorebook selector`, err);
-            select.replaceChildren();
+        if (!select) return;
+        const books = await loadLorebookList(false);
+        const current = selectedName || select.value;
+        select.replaceChildren();
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Выберите Lorebook…';
+        select.append(placeholder);
+        
+        for (const book of books) {
             const option = document.createElement('option');
-            option.value = '';
-            option.textContent = 'Не удалось загрузить список — нажми «Обновить список»';
+            option.value = book.file_id || book.name; // API expects the filename id, not the display label.
+            option.textContent = book.name || book.file_id;
             select.append(option);
-            setPanelStatus(`Не удалось загрузить список Lorebook: ${err.message}`, 'warning');
-            return [];
+        }
+        
+        const matched = books.find(b => (b.file_id || b.name) === current || b.name === current);
+        select.value = matched ? (matched.file_id || matched.name) : '';
+        if (matched && current !== select.value) {
+            const state = getState();
+            if (state) { state.targetLorebook = select.value; await saveState(false); }
+        }
+        if (current && !matched) {
+            const state = getState();
+            if (state) { state.targetLorebook = ''; await saveState(false); }
+            toast('Ранее выбранный Lorebook не найден. Выберите книгу заново.', 'warning');
         }
     }
 
@@ -1103,21 +1034,17 @@ ${body}
             const textEl = mesEl.querySelector('.mes_text');
             if (!textEl) return;
 
-            let htmlToAdd = '';
-            // Строгий порядок: Сеттинг -> Персонажи -> Мысли
-            if (settings().trackSceneModule) {
-                const scene = parseSceneBlock(messageText(mes));
-                if (scene) htmlToAdd += sceneFooterMarkup(scene);
-            }
-            if (settings().trackCharacterModule) {
-                const chars = parseCharacterBlock(messageText(mes));
-                if (chars) htmlToAdd += characterFooterMarkup(chars);
-            }
-            if (settings().trackThoughtsModule) {
-                const thoughts = parseThoughtBlock(messageText(mes));
-                if (thoughts) htmlToAdd += thoughtFooterMarkup(thoughts);
-            }
-            
+            // Резервный рендер также использует фиксированный порядок модулей.
+            const text = messageText(mes);
+            const scene = settings().trackSceneModule ? parseSceneBlock(text) : null;
+            const chars = settings().trackCharacterModule ? parseCharacterBlock(text) : null;
+            const thoughts = settings().trackThoughtsModule ? parseThoughtBlock(text) : null;
+            const footerOrder = [
+                () => scene ? sceneFooterMarkup(scene) : '',
+                () => chars ? characterFooterMarkup(chars) : '',
+                () => thoughts ? thoughtFooterMarkup(thoughts) : '',
+            ];
+            const htmlToAdd = footerOrder.map(render => render()).join('');
             if (htmlToAdd) textEl.insertAdjacentHTML('beforeend', htmlToAdd);
         });
     }
@@ -1158,12 +1085,13 @@ ${body}
                 try { syncBlocksToState(messageId, scene, chars, thoughts); } catch (err) { console.warn(`[${MODULE}] scene sync failed`, err); }
                 
                 let stripped = stripBlocksFromHtml(html);
-                let footers = '';
-                // Строгий порядок вывода
-                if (scene) footers += sceneFooterMarkup(scene);
-                if (chars) footers += characterFooterMarkup(chars);
-                if (thoughts) footers += thoughtFooterMarkup(thoughts);
-                
+                // Единый фиксированный порядок модулей: текущий сетинг -> замеченные персонажи -> тайные мысли.
+                const footerOrder = [
+                    () => scene ? sceneFooterMarkup(scene) : '',
+                    () => chars ? characterFooterMarkup(chars) : '',
+                    () => thoughts ? thoughtFooterMarkup(thoughts) : '',
+                ];
+                const footers = footerOrder.map(render => render()).join('');
                 return stripped + footers;
             }, { stage: formatter.stage?.AFTER_MARKDOWN, order: formatter.order?.LATEST });
             registerMessageFormatter.done = true;
@@ -1193,23 +1121,13 @@ ${body}
         undoBtn.addEventListener('click', undoLast);
         const analyzeBtn = document.createElement('button');
         analyzeBtn.textContent = 'Анализировать сейчас';
-        analyzeBtn.addEventListener('click', () => runButtonAction(analyzeBtn, 'Анализирую…', () => analyzeLatestExchange(true), 'Анализ завершён.'));
+        analyzeBtn.addEventListener('click', () => analyzeLatestExchange());
         const syncBtn = document.createElement('button');
-        syncBtn.className = 'dr-sync-button';
         syncBtn.textContent = 'Сохранить в Lorebook';
-        syncBtn.addEventListener('click', () => runButtonAction(syncBtn, 'Сохраняю…', () => syncToSelectedLorebook(true), 'Lorebook сохранён и проверен.'));
-        syncBtn.disabled = false; // Keep clickable so the user receives an explanation when setup is incomplete.
+        syncBtn.addEventListener('click', () => syncToSelectedLorebook(true));
+        syncBtn.disabled = state.storageMode !== 'both' || !state.targetLorebook;
         toolbar.append(exportBtn, undoBtn, analyzeBtn, syncBtn);
         content.append(toolbar);
-
-        const actionStatus = document.createElement('div');
-        actionStatus.className = 'dr-action-status';
-        actionStatus.setAttribute('role', 'status');
-        actionStatus.setAttribute('aria-live', 'polite');
-        actionStatus.hidden = !panelActionStatus.text;
-        actionStatus.dataset.type = panelActionStatus.type;
-        actionStatus.textContent = panelActionStatus.text;
-        content.append(actionStatus);
 
         const configBox = document.createElement('section');
         configBox.className = 'dr-config';
@@ -1351,24 +1269,17 @@ ${body}
         loreLabel.append(loreText, loreSelect);
         const refreshBooks = document.createElement('button');
         refreshBooks.textContent = 'Обновить список';
-        refreshBooks.addEventListener('click', () => runButtonAction(refreshBooks, 'Загружаю…', async () => {
-            lorebookListCache = null;
-            const books = await loadLorebookList(true);
+        refreshBooks.addEventListener('click', async () => {
+            await loadLorebookList(true);
             await populateLorebookSelect(loreSelect, state.targetLorebook);
-            if (!books.length) {
-                setPanelStatus('Список загружен, но Lorebook не найдены. Создай книгу в World Info.', 'warning');
-                return false;
-            }
-            setPanelStatus(`Список обновлён: найдено книг — ${books.length}.`, 'success');
-            updateStorageControls();
-            return true;
-        }, 'Список Lorebook обновлён.'));
+            if (!lorebookListCache?.length) toast('Lorebook не найдены. Создайте книгу в World Info.', 'info');
+        });
 
         const updateStorageControls = () => {
             const useLorebook = state.storageMode === 'both';
-            loreSelect.disabled = false;
-            refreshBooks.disabled = false;
-            syncBtn.disabled = false; // The handler explains which setting is missing.
+            loreSelect.disabled = !useLorebook;
+            refreshBooks.disabled = !useLorebook;
+            syncBtn.disabled = !useLorebook || !state.targetLorebook;
         };
         storageSelect.addEventListener('change', async () => {
             state.storageMode = storageSelect.value;
@@ -1376,10 +1287,8 @@ ${body}
             updateStorageControls();
             if (state.storageMode === 'both' && state.targetLorebook) {
                 await syncToSelectedLorebook(true);
-            } else if (state.storageMode === 'both') {
-                toast('Выбери Lorebook — после этого можно будет синхронизировать данные.', 'info');
             } else {
-                toast('Режим сохранения: только внутренняя база чата.', 'success');
+                toast('Сохранение продолжается во внутренней базе чата.');
             }
         });
 
@@ -1388,7 +1297,6 @@ ${body}
             state.lorebookEntryUid = null;
             await saveState(false);
             if (state.storageMode === 'both' && state.targetLorebook) await syncToSelectedLorebook(true);
-            else if (state.targetLorebook) toast(`Выбран Lorebook «${state.targetLorebook}».`, 'success');
             updateStorageControls();
         });
 

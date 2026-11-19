@@ -196,36 +196,3 @@
     white-space: pre-wrap;
     word-break: break-word;
 }
-
-/* Action feedback: clear running/pressed states and visible operation result */
-#dynamic-relationships-extension .dr-toolbar button {
-    position: relative;
-    transition: filter .12s ease, transform .12s ease, opacity .12s ease;
-}
-#dynamic-relationships-extension .dr-toolbar button:active {
-    transform: translateY(1px);
-    filter: brightness(1.18);
-}
-#dynamic-relationships-extension .dr-toolbar button:disabled {
-    opacity: .48;
-    cursor: not-allowed;
-}
-#dynamic-relationships-extension .dr-toolbar button.dr-action-running {
-    opacity: .78;
-    cursor: progress;
-    box-shadow: inset 0 0 0 1px var(--SmartThemeEmColor, #888);
-}
-#dynamic-relationships-extension .dr-action-status {
-    margin: .45rem 0 .65rem;
-    padding: .45rem .65rem;
-    border: 1px solid var(--SmartThemeBorderColor);
-    border-left: 3px solid var(--SmartThemeQuoteColor);
-    border-radius: 5px;
-    font-size: .86em;
-    line-height: 1.4;
-    overflow-wrap: anywhere;
-}
-#dynamic-relationships-extension .dr-action-status[hidden] { display: none; }
-#dynamic-relationships-extension .dr-action-status[data-type="success"] { border-left-color: #4aaf78; }
-#dynamic-relationships-extension .dr-action-status[data-type="warning"] { border-left-color: #d69a42; }
-#dynamic-relationships-extension .dr-action-status[data-type="error"] { border-left-color: #d65b5b; }
